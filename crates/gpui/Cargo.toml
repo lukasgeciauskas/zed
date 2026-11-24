@@ -265,6 +265,10 @@ name = "shadow"
 path = "examples/shadow.rs"
 
 [[example]]
+name = "astryx_transforms"
+path = "examples/astryx_transforms.rs"
+
+[[example]]
 name = "svg"
 path = "examples/svg/svg.rs"
 

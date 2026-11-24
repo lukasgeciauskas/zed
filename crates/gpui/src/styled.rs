@@ -3,7 +3,7 @@ use crate::{
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
     SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    TextStyleRefinement, UnderlineStyle, WhiteSpace, point, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -745,6 +745,46 @@ pub trait Styled: Sized {
     /// Sets the opacity of this element and its children.
     fn opacity(mut self, opacity: f32) -> Self {
         self.style().opacity = Some(opacity);
+        self
+    }
+
+    /// Scales this element and its children when painted, around the
+    /// transform origin (the center by default), like CSS `scale`. Layout,
+    /// and so the space the element takes, is unaffected.
+    fn scale(mut self, scale: f32) -> Self {
+        self.style().scale = Some(point(scale, scale));
+        self
+    }
+
+    /// Scales each axis separately, like CSS `scale: x y`. A negative factor
+    /// mirrors that axis.
+    fn scale_xy(mut self, x: f32, y: f32) -> Self {
+        self.style().scale = Some(point(x, y));
+        self
+    }
+
+    /// Moves this element and its children when painted, like CSS
+    /// `translate`. Relative lengths are fractions of the element's own size.
+    fn translate(mut self, x: impl Into<DefiniteLength>, y: impl Into<DefiniteLength>) -> Self {
+        self.style().translate = Some(point(x.into(), y.into()));
+        self
+    }
+
+    /// Moves this element horizontally when painted, like CSS `translate: x`.
+    fn translate_x(self, x: impl Into<DefiniteLength>) -> Self {
+        self.translate(x, px(0.))
+    }
+
+    /// Moves this element vertically when painted, like CSS `translate: 0 y`.
+    fn translate_y(self, y: impl Into<DefiniteLength>) -> Self {
+        self.translate(px(0.), y)
+    }
+
+    /// Sets the point `scale` happens around, as fractions of the element's
+    /// size, like CSS `transform-origin`. The default is the center,
+    /// `(0.5, 0.5)`.
+    fn transform_origin(mut self, x: f32, y: f32) -> Self {
+        self.style().transform_origin = Some(point(x, y));
         self
     }
 

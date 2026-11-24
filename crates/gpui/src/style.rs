@@ -301,6 +301,18 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// Scales the element and its subtree when painted, around
+    /// `transform_origin`, like CSS `scale`. Layout is unaffected.
+    pub scale: Option<Point<f32>>,
+
+    /// Moves the element and its subtree when painted, like CSS `translate`.
+    /// Relative lengths are fractions of the element's own size.
+    pub translate: Option<Point<DefiniteLength>>,
+
+    /// The point `scale` happens around, as fractions of the element's size,
+    /// like CSS `transform-origin`. Defaults to the center.
+    pub transform_origin: Option<Point<f32>>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -617,6 +629,22 @@ impl Hash for HighlightStyle {
 }
 
 impl Style {
+    /// The transform `scale`, `translate` and `transform_origin` give an
+    /// element at `bounds`, or `None` when they change nothing.
+    pub fn element_transform(
+        &self,
+        bounds: Bounds<Pixels>,
+        rem_size: Pixels,
+    ) -> Option<crate::ElementTransform> {
+        crate::element_transform::resolve_element_transform(
+            self.scale,
+            self.translate,
+            self.transform_origin,
+            bounds,
+            rem_size,
+        )
+    }
+
     /// Returns true if the style is visible and the background is opaque.
     pub fn has_opaque_background(&self) -> bool {
         self.background
@@ -809,6 +837,9 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            scale: None,
+            translate: None,
+            transform_origin: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

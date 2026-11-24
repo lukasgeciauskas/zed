@@ -123,7 +123,10 @@ impl Scene {
                 continue;
             };
             let pose = animation.transformation.at(elapsed);
-            sprite.transformation = pose.into_matrix(animation.center, animation.scale_factor);
+            sprite.transformation = animation.element_transform.after_matrix(
+                pose.into_matrix(animation.center, animation.scale_factor),
+                animation.scale_factor,
+            );
             sprite.color = animation.base_color.opacity(pose.alpha_factor());
         }
     }
@@ -1099,6 +1102,8 @@ pub(crate) struct SpriteAnimation {
     transformation: TimedTransformation,
     center: Point<Pixels>,
     scale_factor: f32,
+    /// The transform of the element the sprite is in, applied after each pose.
+    element_transform: crate::ElementTransform,
     base_color: Hsla,
     sprite_index: usize,
 }
@@ -1113,9 +1118,16 @@ impl SpriteAnimation {
             transformation,
             center,
             scale_factor,
+            element_transform: crate::ElementTransform::IDENTITY,
             base_color: Hsla::default(),
             sprite_index: usize::MAX,
         }
+    }
+}
+
+impl SpriteAnimation {
+    pub(crate) fn set_element_transform(&mut self, transform: crate::ElementTransform) {
+        self.element_transform = transform;
     }
 }
 

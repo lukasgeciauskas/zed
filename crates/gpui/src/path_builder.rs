@@ -402,6 +402,46 @@ impl Path {
         self.even_odd
     }
 
+    /// The path mapped through `transform`. Curves are kept downward: a
+    /// vertical mirror swaps each curve's ends and flips its winding sign.
+    pub(crate) fn transformed(&self, transform: &crate::ElementTransform) -> Self {
+        let (sx, sy) = (transform.scale.width, transform.scale.height);
+        let (tx, ty) = (transform.translation.x.0, transform.translation.y.0);
+        let map = |p: Point<f32>| point(p.x * sx + tx, p.y * sy + ty);
+        let curves = self
+            .curves
+            .iter()
+            .map(|curve| {
+                let (from, to) = (map(curve.p0), map(curve.p1));
+                let (p0, p1, sign) = if sy < 0.0 {
+                    (to, from, -curve.sign)
+                } else {
+                    (from, to, curve.sign)
+                };
+                if curve.a == point(0.0, 0.0) {
+                    PathCurve {
+                        p0,
+                        p1,
+                        a: point(0.0, 0.0),
+                        b: point(p1.x - p0.x, p1.y - p0.y),
+                        sign,
+                        pad: 0,
+                    }
+                } else {
+                    let ctrl = map(point(
+                        curve.p0.x + curve.b.x / 2.0,
+                        curve.p0.y + curve.b.y / 2.0,
+                    ));
+                    PathCurve::new(p0, ctrl, p1, sign)
+                }
+            })
+            .collect::<Vec<_>>();
+        Self {
+            curves: curves.into(),
+            even_odd: self.even_odd,
+        }
+    }
+
     /// Bin the curves into tiles in device pixels, for painting at the given
     /// display scale.
     pub(crate) fn bin(&self, scale: f32) -> PathTiles {
