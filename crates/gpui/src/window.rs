@@ -5979,6 +5979,20 @@ impl Window {
         )
     }
 
+    /// Records where the first line of a measured layout node sits: `baseline` is the
+    /// distance from the node's top to its first baseline. Flex containers aligned on
+    /// baselines, and the line boxes inline-level boxes flow in, line it up with their
+    /// neighbors'. Call it after requesting the node, every frame.
+    ///
+    /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
+    pub fn set_layout_baseline(&mut self, layout_id: LayoutId, baseline: Pixels) {
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .set_baseline(layout_id, baseline, scale_factor);
+    }
+
     /// Like [`Self::request_keyed_measured_layout`], but `reuse` decides whether a key measures
     /// the same as the previous one, and `measure` is given the key and whether this is
     /// the node's final measurement rather than a sizing probe.

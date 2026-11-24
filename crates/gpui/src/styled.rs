@@ -40,6 +40,72 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the display type of the element to `inline-block`: an inline-level box that
+    /// flows in line boxes inside a block container. See [`Display::InlineBlock`].
+    /// [Docs](https://tailwindcss.com/docs/display)
+    fn inline_block(mut self) -> Self {
+        self.style().display = Some(Display::InlineBlock);
+        self
+    }
+
+    /// Sets the display type of the element to `inline-flex`: a flex container that flows
+    /// like a word inside a block container. See [`Display::InlineBlock`].
+    /// [Docs](https://tailwindcss.com/docs/display)
+    fn inline_flex(mut self) -> Self {
+        self.style().display = Some(Display::InlineFlex);
+        self
+    }
+
+    /// Sets the display type of the element to `inline-grid`: a grid container that flows
+    /// like a word inside a block container. See [`Display::InlineBlock`].
+    /// [Docs](https://tailwindcss.com/docs/display)
+    fn inline_grid(mut self) -> Self {
+        self.style().display = Some(Display::InlineGrid);
+        self
+    }
+
+    /// Sets the width to `fit-content`: the content's width, capped at the space available.
+    /// [Docs](https://tailwindcss.com/docs/width#fit-content)
+    fn w_fit(mut self) -> Self {
+        self.style().size.width = Some(Length::FitContent);
+        self
+    }
+
+    /// Sets the width to `min-content`: the content's narrowest width.
+    /// [Docs](https://tailwindcss.com/docs/width#min-content)
+    fn w_min(mut self) -> Self {
+        self.style().size.width = Some(Length::MinContent);
+        self
+    }
+
+    /// Sets the width to `max-content`: the content's widest width.
+    /// [Docs](https://tailwindcss.com/docs/width#max-content)
+    fn w_max(mut self) -> Self {
+        self.style().size.width = Some(Length::MaxContent);
+        self
+    }
+
+    /// Sets the height to `fit-content`.
+    /// [Docs](https://tailwindcss.com/docs/height)
+    fn h_fit(mut self) -> Self {
+        self.style().size.height = Some(Length::FitContent);
+        self
+    }
+
+    /// Sets the height to `min-content`.
+    /// [Docs](https://tailwindcss.com/docs/height)
+    fn h_min(mut self) -> Self {
+        self.style().size.height = Some(Length::MinContent);
+        self
+    }
+
+    /// Sets the height to `max-content`.
+    /// [Docs](https://tailwindcss.com/docs/height)
+    fn h_max(mut self) -> Self {
+        self.style().size.height = Some(Length::MaxContent);
+        self
+    }
+
     /// Sets the display type of the element to `flex`.
     /// [Docs](https://tailwindcss.com/docs/display)
     fn flex(mut self) -> Self {

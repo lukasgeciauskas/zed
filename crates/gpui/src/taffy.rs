@@ -1,6 +1,7 @@
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, PathHash, Pixels,
-    Point, Size, Style, Window, size,
+    AbsoluteLength, AlignItems, App, Bounds, DefiniteLength, Display, Edges, ElementId,
+    FlexDirection, FlexWrap, GridTemplate, JustifyContent, Length, PathHash, Pixels, Point,
+    Position, SharedString, Size, Style, TextAlign, Window, size,
     util::{
         ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
         round_to_device_pixel,
@@ -144,6 +145,10 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// First baselines of measured nodes (text), in device pixels from the top of the
+    /// node, stamped with the frame that set them so a node reused by another element
+    /// never inherits one.
+    baselines: SecondaryMap<DefaultKey, (u64, f32)>,
 }
 
 /// Layout nodes requested by elements under one element ID path, in request order.
@@ -198,6 +203,7 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            baselines: SecondaryMap::new(),
         }
     }
 
@@ -210,6 +216,7 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.baselines.clear();
     }
 
     /// Clears the layout cache when the window's scale factor changes. Taffy stores styles
@@ -248,11 +255,97 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
+        let lines;
+        let children = if style.display.is_block_container()
+            && children.iter().any(|&child| self.is_inline_level(child))
+        {
+            lines = self.group_into_line_boxes(scope, style, rem_size, scale_factor, children);
+            lines.as_slice()
+        } else {
+            children
+        };
         let id = self.acquire_node(scope, style, rem_size, scale_factor, children);
         if self.contexts.remove(node_key(id)).is_some() {
             self.taffy.mark_dirty(id).expect(EXPECT_MESSAGE);
         }
         id.into()
+    }
+
+    /// Whether a node is an in-flow inline-level box (`inline-block`, `inline-flex` or
+    /// `inline-grid`, not absolutely positioned), which flows in line boxes inside a
+    /// block container.
+    fn is_inline_level(&self, id: LayoutId) -> bool {
+        self.cache.nodes.get(node_key(id.0)).is_some_and(|node| {
+            node.style.display.is_inline() && node.style.position != Position::Absolute
+        })
+    }
+
+    /// Wraps each run of consecutive inline-level children of a block container in an
+    /// anonymous line box, as CSS does: a flex row that wraps, so the boxes sit side by
+    /// side at their shrink-to-fit widths, aligned on their first baselines, and start a
+    /// new line when the container runs out of width. The container's `text_align`
+    /// places them along the line. Block-level and absolutely positioned children stay
+    /// where they are, between the runs.
+    fn group_into_line_boxes(
+        &mut self,
+        scope: PathHash,
+        style: &Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        children: &[LayoutId],
+    ) -> SmallVec<[LayoutId; 8]> {
+        let line_scope = scope.extend(&ElementId::Name(SharedString::new_static(
+            "gpui::inline-line-box",
+        )));
+        let line_style = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
+            align_items: Some(AlignItems::Baseline),
+            justify_content: match style.text.text_align {
+                Some(TextAlign::Center) => Some(JustifyContent::Center),
+                Some(TextAlign::Right) => Some(JustifyContent::FlexEnd),
+                _ => None,
+            },
+            ..Style::default()
+        };
+        let mut grouped = SmallVec::new();
+        let mut run: SmallVec<[LayoutId; 8]> = SmallVec::new();
+        let flush = |engine: &mut Self,
+                     run: &mut SmallVec<[LayoutId; 8]>,
+                     out: &mut SmallVec<[LayoutId; 8]>| {
+            if run.is_empty() {
+                return;
+            }
+            let line = engine.acquire_node(line_scope, &line_style, rem_size, scale_factor, run);
+            if engine.contexts.remove(node_key(line)).is_some() {
+                engine.taffy.mark_dirty(line).expect(EXPECT_MESSAGE);
+            }
+            out.push(line.into());
+            run.clear();
+        };
+        for &child in children {
+            if self.is_inline_level(child) {
+                run.push(child);
+            } else {
+                flush(self, &mut run, &mut grouped);
+                grouped.push(child);
+            }
+        }
+        flush(self, &mut run, &mut grouped);
+        grouped
+    }
+
+    /// Records the first baseline of a measured node, such as a line of text, so inline
+    /// and flex containers can align it on its baseline. `baseline` is the distance from
+    /// the top of the node. Call it each frame, after requesting the node.
+    pub(crate) fn set_baseline(&mut self, id: LayoutId, baseline: Pixels, scale_factor: f32) {
+        let value = baseline.0 * scale_factor;
+        let frame = self.cache.frame;
+        let previous = self.baselines.insert(node_key(id.0), (frame, value));
+        if previous.is_none_or(|(_, previous)| previous != value) {
+            self.taffy.mark_dirty(id.0).expect(EXPECT_MESSAGE);
+        }
     }
 
     /// See [`Window::request_keyed_measure`].
@@ -512,13 +605,19 @@ impl TaffyLayoutEngine {
         );
 
         let contexts = &mut self.contexts;
+        let baselines = &self.baselines;
+        let frame = self.cache.frame;
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
                 available_space.into(),
                 |input, id, _, style| {
+                    let baseline = baselines
+                        .get(node_key(id))
+                        .filter(|(set_in, _)| *set_in == frame)
+                        .map(|&(_, baseline)| baseline);
                     let node_context = contexts.get_mut(node_key(id));
-                    taffy::compute_leaf_layout(
+                    let mut output = taffy::compute_leaf_layout(
                         input,
                         style,
                         |_, _| 0.0,
@@ -555,7 +654,11 @@ impl TaffyLayoutEngine {
                             );
                             snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                         },
-                    )
+                    );
+                    if let Some(baseline) = baseline {
+                        output.baselines.first = Some(baseline);
+                    }
+                    output
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -924,7 +1027,10 @@ impl ToTaffy<taffy::style::LengthPercentageAuto> for Length {
     ) -> taffy::prelude::LengthPercentageAuto {
         match self {
             Length::Definite(length) => length.to_taffy(rem_size, scale_factor),
-            Length::Auto => taffy::prelude::LengthPercentageAuto::auto(),
+            // Size keywords mean nothing for margins and insets.
+            Length::Auto | Length::MinContent | Length::MaxContent | Length::FitContent => {
+                taffy::prelude::LengthPercentageAuto::auto()
+            }
         }
     }
 }
@@ -934,6 +1040,9 @@ impl ToTaffy<taffy::style::Dimension> for Length {
         match self {
             Length::Definite(length) => length.to_taffy(rem_size, scale_factor),
             Length::Auto => taffy::prelude::Dimension::auto(),
+            Length::MinContent => taffy::prelude::Dimension::min_content(),
+            Length::MaxContent => taffy::prelude::Dimension::max_content(),
+            Length::FitContent => taffy::prelude::Dimension::fit_content(),
         }
     }
 }
@@ -1641,5 +1750,198 @@ mod tests {
             taffy_border.left,
             taffy::style::LengthPercentage::length(2.0)
         );
+    }
+
+    // Inline layout (Astryx patch R5).
+
+    use crate::point;
+
+    /// The debug bounds of one frame drawn in an 800 × 600 window.
+    fn draw_once(
+        cx: &mut TestAppContext,
+        render: impl Fn(&mut Window) -> AnyElement + 'static,
+    ) -> collections::FxHashMap<String, Bounds<Pixels>> {
+        let frames = Rc::new(vec![frame(render)]);
+        let window = cx.open_window(size(px(800.), px(600.)), move |_, _| FrameView {
+            frame: Rc::new(Cell::new(0)),
+            frames,
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            window
+                .rendered_frame
+                .debug_bounds
+                .iter()
+                .map(|(selector, bounds)| (selector.to_string(), *bounds))
+                .collect()
+        })
+        .expect("window should remain open")
+    }
+
+    fn inline_box(name: &'static str, width: f32) -> impl IntoElement {
+        div()
+            .inline_flex()
+            .w(px(width))
+            .h(px(20.))
+            .debug_selector(move || name.to_string())
+    }
+
+    #[crate::test]
+    fn inline_boxes_sit_side_by_side_and_wrap(cx: &mut TestAppContext) {
+        let bounds = draw_once(cx, |_| {
+            div()
+                .w(px(200.))
+                .child(inline_box("a", 80.))
+                .child(inline_box("b", 80.))
+                .child(inline_box("c", 80.))
+                .into_any_element()
+        });
+        assert_eq!(bounds["a"].origin, point(px(0.), px(0.)));
+        assert_eq!(bounds["b"].origin, point(px(80.), px(0.)));
+        // No room left on the first line: the third box starts the second.
+        assert_eq!(bounds["c"].origin, point(px(0.), px(20.)));
+    }
+
+    #[crate::test]
+    fn inline_boxes_shrink_to_fit_where_blocks_stretch(cx: &mut TestAppContext) {
+        let bounds = draw_once(cx, |_| {
+            let content = || div().w(px(50.)).h(px(10.));
+            div()
+                .w(px(300.))
+                .child(
+                    div()
+                        .inline_flex()
+                        .debug_selector(|| "inline".into())
+                        .child(content()),
+                )
+                .child(div().debug_selector(|| "block".into()).child(content()))
+                .into_any_element()
+        });
+        assert_eq!(bounds["inline"].size.width, px(50.));
+        assert_eq!(bounds["block"].size.width, px(300.));
+    }
+
+    #[crate::test]
+    fn text_align_places_inline_boxes_along_the_line(cx: &mut TestAppContext) {
+        let bounds = draw_once(cx, |_| {
+            div()
+                .w(px(300.))
+                .child(div().text_center().child(inline_box("centered", 100.)))
+                .child(div().text_right().child(inline_box("right", 100.)))
+                .into_any_element()
+        });
+        assert_eq!(bounds["centered"].origin.x, px(100.));
+        assert_eq!(bounds["right"].origin.x, px(200.));
+    }
+
+    #[crate::test]
+    fn block_children_split_the_runs_of_inline_boxes(cx: &mut TestAppContext) {
+        let bounds = draw_once(cx, |_| {
+            div()
+                .w(px(300.))
+                .child(inline_box("a", 50.))
+                .child(div().h(px(10.)).debug_selector(|| "block".into()))
+                .child(inline_box("b", 50.))
+                .into_any_element()
+        });
+        assert_eq!(bounds["block"].origin.y, px(20.));
+        assert_eq!(bounds["b"].origin, point(px(0.), px(30.)));
+    }
+
+    #[crate::test]
+    fn inline_boxes_are_ordinary_items_of_flex_containers(cx: &mut TestAppContext) {
+        let bounds = draw_once(cx, |_| {
+            div()
+                .flex()
+                .flex_col()
+                .w(px(300.))
+                .child(
+                    div()
+                        .inline_flex()
+                        .h(px(20.))
+                        .debug_selector(|| "item".into()),
+                )
+                .into_any_element()
+        });
+        // A flex column stretches its items, inline-level or not, as CSS does.
+        assert_eq!(bounds["item"].size.width, px(300.));
+    }
+
+    #[crate::test]
+    fn size_keywords_size_to_the_content(cx: &mut TestAppContext) {
+        let bounds = draw_once(cx, |_| {
+            let content = || div().w(px(60.)).h(px(10.));
+            div()
+                .flex()
+                .flex_col()
+                .w(px(300.))
+                .child(
+                    div()
+                        .w_fit()
+                        .debug_selector(|| "fit".into())
+                        .child(content()),
+                )
+                .child(
+                    div()
+                        .w_max()
+                        .debug_selector(|| "max".into())
+                        .child(content()),
+                )
+                .child(
+                    div()
+                        .w_min()
+                        .debug_selector(|| "min".into())
+                        .child(content()),
+                )
+                .into_any_element()
+        });
+        for name in ["fit", "max", "min"] {
+            assert_eq!(bounds[name].size.width, px(60.), "{name}");
+        }
+    }
+
+    #[crate::test]
+    fn inline_boxes_align_on_their_text_baselines(cx: &mut TestAppContext) {
+        let bounds = draw_once(cx, |_| {
+            div()
+                .w(px(400.))
+                .child(
+                    div()
+                        .inline_flex()
+                        .pt(px(10.))
+                        .debug_selector(|| "padded".into())
+                        .child("Padded"),
+                )
+                .child(
+                    div()
+                        .inline_flex()
+                        .debug_selector(|| "plain".into())
+                        .child("Plain"),
+                )
+                .into_any_element()
+        });
+        // The plain box drops by the padding, so both texts share one baseline.
+        assert_eq!(bounds["padded"].origin.y, px(0.));
+        assert_eq!(bounds["plain"].origin.y, px(10.));
+    }
+
+    #[crate::test]
+    fn line_boxes_match_an_uncached_layout(cx: &mut TestAppContext) {
+        let frames = (0..3)
+            .map(|step| {
+                frame(move |_| {
+                    let mut parent = div().w(px(200. + step as f32 * 50.));
+                    for index in 0..=step {
+                        parent = parent.child(inline_box(["first", "second", "third"][index], 90.));
+                    }
+                    parent
+                        .child(div().h(px(5.)).debug_selector(|| "block".into()))
+                        .child(inline_box("after", 40.))
+                        .into_any_element()
+                })
+            })
+            .collect();
+        assert_frames_match_uncached(cx, frames);
     }
 }

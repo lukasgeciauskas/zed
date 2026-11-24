@@ -3724,6 +3724,16 @@ pub enum Length {
     Definite(DefiniteLength),
     /// An automatic length that is determined by the context in which it is used.
     Auto,
+    /// The content's narrowest size, wrapping at every opportunity: CSS `min-content`.
+    /// A size keyword: for margins and insets it means `auto`.
+    MinContent,
+    /// The content's widest size, never wrapping: CSS `max-content`.
+    /// A size keyword: for margins and insets it means `auto`.
+    MaxContent,
+    /// The content's widest size, but no wider than the space available and no narrower
+    /// than its narrowest: CSS `fit-content`, the shrink-to-fit size of inline boxes.
+    /// A size keyword: for margins and insets it means `auto`.
+    FitContent,
 }
 
 impl Debug for Length {
@@ -3737,11 +3747,14 @@ impl Display for Length {
         match self {
             Length::Definite(definite_length) => write!(f, "{}", definite_length),
             Length::Auto => write!(f, "auto"),
+            Length::MinContent => write!(f, "min-content"),
+            Length::MaxContent => write!(f, "max-content"),
+            Length::FitContent => write!(f, "fit-content"),
         }
     }
 }
 
-const EXPECTED_LENGTH: &str = "expected 'auto' or number with 'px', 'rem', or '%' suffix";
+const EXPECTED_LENGTH: &str = "expected 'auto', 'min-content', 'max-content', 'fit-content' or number with 'px', 'rem', or '%' suffix";
 
 impl TryFrom<&'_ str> for Length {
     type Error = anyhow::Error;
@@ -3749,6 +3762,12 @@ impl TryFrom<&'_ str> for Length {
     fn try_from(value: &'_ str) -> Result<Self, Self::Error> {
         if value == "auto" {
             Ok(Length::Auto)
+        } else if value == "min-content" {
+            Ok(Length::MinContent)
+        } else if value == "max-content" {
+            Ok(Length::MaxContent)
+        } else if value == "fit-content" {
+            Ok(Length::FitContent)
         } else if let Ok(definite_length) = value.try_into() {
             Ok(Length::Definite(definite_length))
         } else {
@@ -3767,7 +3786,7 @@ impl JsonSchema for Length {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         json_schema!({
             "type": "string",
-            "pattern": r"^(auto|-?\d+(\.\d+)?(px|rem|%))$"
+            "pattern": r"^(auto|min-content|max-content|fit-content|-?\d+(\.\d+)?(px|rem|%))$"
         })
     }
 }
@@ -3799,6 +3818,22 @@ impl Serialize for Length {
     {
         serializer.serialize_str(&format!("{self}"))
     }
+}
+
+/// The CSS `min-content` size: the content's narrowest, wrapping at every opportunity.
+pub const fn min_content() -> Length {
+    Length::MinContent
+}
+
+/// The CSS `max-content` size: the content's widest, never wrapping.
+pub const fn max_content() -> Length {
+    Length::MaxContent
+}
+
+/// The CSS `fit-content` size: the content's widest, but no wider than the space
+/// available (and no narrower than its narrowest).
+pub const fn fit_content() -> Length {
+    Length::FitContent
 }
 
 /// Constructs a `DefiniteLength` representing a relative fraction of a parent size.
@@ -4041,7 +4076,7 @@ impl IsZero for Length {
     fn is_zero(&self) -> bool {
         match self {
             Length::Definite(length) => length.is_zero(),
-            Length::Auto => false,
+            Length::Auto | Length::MinContent | Length::MaxContent | Length::FitContent => false,
         }
     }
 }

@@ -1169,6 +1169,36 @@ pub enum Display {
     Grid,
     /// The children will not be laid out, and will follow absolute positioning
     None,
+    /// An inline-level box whose children follow the block layout: CSS `inline-block`.
+    ///
+    /// In a block container, consecutive inline-level children share line boxes: they
+    /// sit side by side at their shrink-to-fit width, aligned on their first baselines,
+    /// and wrap to a new line when the container runs out of width (the container's
+    /// `text_align` places them along the line). In a flex or grid container an
+    /// inline-level child is an ordinary item, as in CSS.
+    InlineBlock,
+    /// An inline-level box whose children follow the flexbox layout: CSS `inline-flex`.
+    /// See [`Display::InlineBlock`] for how inline-level boxes flow.
+    InlineFlex,
+    /// An inline-level box whose children follow the grid layout: CSS `inline-grid`.
+    /// See [`Display::InlineBlock`] for how inline-level boxes flow.
+    InlineGrid,
+}
+
+impl Display {
+    /// Whether the box is inline-level: it flows in line boxes inside a block container.
+    pub fn is_inline(self) -> bool {
+        matches!(
+            self,
+            Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
+        )
+    }
+
+    /// Whether the box lays its own children out with the block algorithm, so inline-level
+    /// children flow in line boxes inside it.
+    pub fn is_block_container(self) -> bool {
+        matches!(self, Display::Block | Display::InlineBlock)
+    }
 }
 
 /// Controls whether flex items are forced onto one line or can wrap onto multiple lines.
@@ -1310,9 +1340,9 @@ impl From<AlignContent> for taffy::style::AlignContent {
 impl From<Display> for taffy::style::Display {
     fn from(value: Display) -> Self {
         match value {
-            Display::Block => Self::Block,
-            Display::Flex => Self::Flex,
-            Display::Grid => Self::Grid,
+            Display::Block | Display::InlineBlock => Self::Block,
+            Display::Flex | Display::InlineFlex => Self::Flex,
+            Display::Grid | Display::InlineGrid => Self::Grid,
             Display::None => Self::None,
         }
     }

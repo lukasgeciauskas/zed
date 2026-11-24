@@ -816,12 +816,28 @@ impl TextLayout {
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
-        window.request_keyed_measure(
+        let measurement = self.measurement(text, runs, window);
+        // The first line's baseline, so the text aligns with its neighbors in line boxes
+        // and baseline-aligned flex rows.
+        let first_font = measurement
+            .runs
+            .first()
+            .map(|run| run.font.clone())
+            .unwrap_or_else(|| measurement.text_style.font());
+        let text_system = window.text_system();
+        let baseline = text_system.baseline_offset(
+            text_system.resolve_font(&first_font),
+            measurement.font_size,
+            measurement.line_height,
+        );
+        let layout_id = window.request_keyed_measure(
             &crate::Style::default(),
-            self.measurement(text, runs, window),
+            measurement,
             TextMeasure::reuse_measurement,
             TextMeasure::measure,
-        )
+        );
+        window.set_layout_baseline(layout_id, baseline);
+        layout_id
     }
 
     fn measurement(
