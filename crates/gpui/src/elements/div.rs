@@ -1482,6 +1482,52 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Mark this control as disabled for assistive technology (`aria-disabled`).
+    /// It stays focusable if it tracks focus; the flag only tells assistive
+    /// technology that it does not accept input.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = disabled;
+        self
+    }
+
+    /// Mark a text field (or similar) as read-only: focusable and selectable,
+    /// but not editable (`aria-readonly`).
+    fn aria_read_only(mut self, read_only: bool) -> Self {
+        self.interactivity().aria.read_only = read_only;
+        self
+    }
+
+    /// Mark this control as requiring a value (`aria-required`).
+    fn aria_required(mut self, required: bool) -> Self {
+        self.interactivity().aria.required = required;
+        self
+    }
+
+    /// Mark this control's value as invalid (`aria-invalid="true"`).
+    fn aria_invalid(mut self, invalid: bool) -> Self {
+        self.interactivity().aria.invalid = invalid;
+        self
+    }
+
+    /// Mark this element as busy, e.g. while it loads or saves (`aria-busy`).
+    fn aria_busy(mut self, busy: bool) -> Self {
+        self.interactivity().aria.busy = busy;
+        self
+    }
+
+    /// Mark a dialog as modal (`aria-modal`).
+    fn aria_modal(mut self, modal: bool) -> Self {
+        self.interactivity().aria.modal = modal;
+        self
+    }
+
+    /// Mark a list or grid as allowing more than one selected item
+    /// (`aria-multiselectable`).
+    fn aria_multiselectable(mut self, multiselectable: bool) -> Self {
+        self.interactivity().aria.multiselectable = multiselectable;
+        self
+    }
+
     /// Set the minimum numeric value for this element.
     fn aria_min_numeric_value(mut self, value: f64) -> Self {
         self.interactivity().aria.min_numeric_value = Some(value);
@@ -2215,6 +2261,14 @@ pub(crate) struct AriaProperties {
     pub(crate) column_index: Option<usize>,
     pub(crate) row_count: Option<usize>,
     pub(crate) column_count: Option<usize>,
+    // Astryx patch R6: ARIA states.
+    pub(crate) disabled: bool,
+    pub(crate) read_only: bool,
+    pub(crate) required: bool,
+    pub(crate) invalid: bool,
+    pub(crate) busy: bool,
+    pub(crate) modal: bool,
+    pub(crate) multiselectable: bool,
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -3713,6 +3767,27 @@ impl Interactivity {
         if let Some(count) = self.aria.column_count {
             node.set_column_count(count);
         }
+        if self.aria.disabled {
+            node.set_disabled();
+        }
+        if self.aria.read_only {
+            node.set_read_only();
+        }
+        if self.aria.required {
+            node.set_required();
+        }
+        if self.aria.invalid {
+            node.set_invalid(accesskit::Invalid::True);
+        }
+        if self.aria.busy {
+            node.set_busy();
+        }
+        if self.aria.modal {
+            node.set_modal();
+        }
+        if self.aria.multiselectable {
+            node.set_multiselectable();
+        }
         if !self.click_listeners.is_empty() {
             node.add_action(accesskit::Action::Click);
         }
@@ -4551,6 +4626,38 @@ impl ScrollHandle {
 
 #[cfg(test)]
 mod tests {
+    /// Astryx patch R6: ARIA states reach the accessibility node, and unset
+    /// ones stay absent.
+    #[test]
+    fn aria_states_reach_the_node() {
+        use crate::{InteractiveElement as _, StatefulInteractiveElement as _, div};
+        let mut el = div()
+            .id("field")
+            .aria_disabled(true)
+            .aria_read_only(true)
+            .aria_required(true)
+            .aria_invalid(true)
+            .aria_busy(true)
+            .aria_modal(true)
+            .aria_multiselectable(true);
+        let mut node = accesskit::Node::new(accesskit::Role::TextInput);
+        el.interactivity().write_a11y_info(&mut node);
+        assert!(node.is_disabled());
+        assert!(node.is_read_only());
+        assert!(node.is_required());
+        assert_eq!(node.invalid(), Some(accesskit::Invalid::True));
+        assert!(node.is_busy());
+        assert!(node.is_modal());
+        assert!(node.is_multiselectable());
+
+        let mut plain = div().id("plain").aria_disabled(false);
+        let mut node = accesskit::Node::new(accesskit::Role::TextInput);
+        plain.interactivity().write_a11y_info(&mut node);
+        assert!(!node.is_disabled());
+        assert!(!node.is_required());
+        assert_eq!(node.invalid(), None);
+    }
+
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, IntoElement,
