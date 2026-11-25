@@ -1626,6 +1626,12 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set the sort direction of a column header (`aria-sort`, Astryx patch R14).
+    fn aria_sort(mut self, direction: accesskit::SortDirection) -> Self {
+        self.interactivity().aria.sort_direction = Some(direction);
+        self
+    }
+
     /// Register a handler for an accessibility action on this element.
     /// The handler is called when a screen reader requests the given action.
     ///
@@ -2311,6 +2317,8 @@ pub(crate) struct AriaProperties {
     pub(crate) current: Option<accesskit::AriaCurrent>,
     // Astryx patch R12: the kind of popup a trigger opens.
     pub(crate) has_popup: Option<accesskit::HasPopup>,
+    // Astryx patch R14: a sorted column header's direction.
+    pub(crate) sort_direction: Option<accesskit::SortDirection>,
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -3821,6 +3829,9 @@ impl Interactivity {
         }
         if let Some(count) = self.aria.column_count {
             node.set_column_count(count);
+        }
+        if let Some(direction) = self.aria.sort_direction {
+            node.set_sort_direction(direction);
         }
         if self.aria.disabled {
             node.set_disabled();

@@ -114,7 +114,7 @@ pub mod private {
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 
 pub use accesskit::{
-    Action as AccessibleAction, AriaCurrent, HasPopup, Orientation, Role, Toggled,
+    Action as AccessibleAction, AriaCurrent, HasPopup, Orientation, Role, SortDirection, Toggled,
 };
 pub use action::*;
 pub use anyhow::Result;
