@@ -1544,6 +1544,20 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Report this element as the active descendant of the element that
+    /// tracks `focus` (`aria-activedescendant`), while that element holds
+    /// focus, wherever this element sits in the tree: the options of a
+    /// listbox that a combobox keeps in another layer, such as a select's
+    /// popup or a typeahead's results. Assistive technology then announces
+    /// this element as focused. It needs a role, as any node does.
+    ///
+    /// Unlike [`InteractiveElement::aria_active_descendant`], the focused
+    /// element need not be an ancestor.
+    fn aria_active_descendant_of(mut self, focus: &FocusHandle) -> Self {
+        self.interactivity().active_descendant_of = Some(focus.clone());
+        self
+    }
+
     /// Mark this element as the trigger of a popup of `kind`
     /// (`aria-haspopup`): a dialog, menu, listbox, tree or grid (Astryx
     /// patch R12).
@@ -2369,6 +2383,8 @@ pub struct Interactivity {
         Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
     pub(crate) a11y_synthetic_children: Option<Box<dyn FnOnce(&mut crate::A11ySubtreeBuilder)>>,
     pub(crate) report_active_descendant_focus: bool,
+    // Astryx patch R13: the active descendant of an element elsewhere.
+    pub(crate) active_descendant_of: Option<FocusHandle>,
     pub(crate) override_role: Option<accesskit::Role>,
     pub(crate) aria: AriaProperties,
 
@@ -2525,6 +2541,15 @@ impl Interactivity {
                     .a11y
                     .set_active_descendant(global_id.accesskit_node_id());
             }
+        }
+        if let Some(owner) = self.active_descendant_of.as_ref()
+            && window.a11y.is_active()
+            && owner.is_focused(window)
+            && let Some(global_id) = global_id
+        {
+            window
+                .a11y
+                .set_active_descendant_of_focused(global_id.accesskit_node_id());
         }
         window.with_optional_element_state::<InteractiveElementState, _>(
             global_id,

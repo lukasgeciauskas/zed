@@ -271,6 +271,18 @@ impl A11y {
         }
     }
 
+    /// Astryx patch R13: an active descendant named by the focused element's
+    /// handle rather than found under it, such as an option in a popup layer
+    /// that its combobox keeps focus outside of. It needs a focused node.
+    pub(crate) fn set_active_descendant_of_focused(&mut self, node_id: NodeId) {
+        if self.nodes.node_is_focused(node_id) || self.nodes.focus.is_none() {
+            return;
+        }
+        if self.nodes.has_node(node_id) {
+            self.nodes.set_active_descendant(node_id);
+        }
+    }
+
     /// Clear per-frame state and push the root node to start a new frame.
     pub(crate) fn begin_frame(&mut self) {
         self.focus_ids.clear();
@@ -835,6 +847,29 @@ mod tests {
         assert!(a11y.nodes.push(node, test_node()));
         // set_focusable was never called for `node`.
         a11y.set_focus(node);
+    }
+
+    // Astryx patch R13: a node outside the focused one (a popup's option)
+    // becomes the reported focus while the focused node exists.
+    #[test]
+    fn active_descendant_of_focused_outside_it() {
+        let mut a11y = new_a11y();
+        let combobox = NodeId(1);
+        let option = NodeId(2);
+        assert!(a11y.nodes.push(combobox, test_node()));
+        a11y.set_focusable(combobox, FocusId::default());
+        a11y.set_focus(combobox);
+        a11y.nodes.pop();
+        assert!(a11y.nodes.push(option, test_node()));
+        a11y.set_active_descendant_of_focused(option);
+        a11y.nodes.pop();
+        assert_eq!(a11y.nodes.active_descendant, Some(option));
+
+        // Without a focused node the claim is ignored.
+        let mut a11y = new_a11y();
+        assert!(a11y.nodes.push(option, test_node()));
+        a11y.set_active_descendant_of_focused(option);
+        assert_eq!(a11y.nodes.active_descendant, None);
     }
 
     // The focused node cannot also be its own active descendant: panic in
