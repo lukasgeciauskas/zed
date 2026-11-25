@@ -878,6 +878,129 @@ impl PlatformWindow for WebWindow {
         None
     }
 
+    fn native_picker_supported(&self, _kind: gpui::NativePickerKind) -> bool {
+        true
+    }
+
+    // Astryx patch R16: the browser's own picker, through a hidden
+    // `<input type="date|time|datetime-local">` laid over the field and
+    // opened with `showPicker()` (focus alone raises it on touch browsers).
+    // A pick reports `change`; Escape, `cancel` or focus leaving it closes
+    // it without a value.
+    fn show_native_picker(
+        &self,
+        request: gpui::NativePickerRequest,
+    ) -> Option<futures::channel::oneshot::Receiver<gpui::NativePickerOutcome>> {
+        use gpui::{NativePickerKind, NativePickerOutcome};
+        use wasm_bindgen::JsCast as _;
+
+        let document = self.inner.browser_window.document()?;
+        let input = document
+            .create_element("input")
+            .ok()?
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .ok()?;
+        input.set_type(match request.kind {
+            NativePickerKind::Date => "date",
+            NativePickerKind::Time => "time",
+            NativePickerKind::DateTime => "datetime-local",
+        });
+        if request.seconds {
+            input.set_step("1");
+        }
+        if let Some(value) = &request.value {
+            input.set_value(value);
+        }
+        if let Some(min) = &request.min {
+            input.set_min(min);
+        }
+        if let Some(max) = &request.max {
+            input.set_max(max);
+        }
+        let rect = self.inner.canvas.get_bounding_client_rect();
+        let anchor = request.anchor;
+        let style = input.style();
+        for (property, value) in [
+            ("position", "fixed".to_string()),
+            (
+                "left",
+                format!("{}px", rect.left() + f64::from(f32::from(anchor.origin.x))),
+            ),
+            (
+                "top",
+                format!("{}px", rect.top() + f64::from(f32::from(anchor.origin.y))),
+            ),
+            ("width", format!("{}px", f32::from(anchor.size.width))),
+            ("height", format!("{}px", f32::from(anchor.size.height))),
+            ("opacity", "0".to_string()),
+            ("pointer-events", "none".to_string()),
+            ("border", "0".to_string()),
+            ("padding", "0".to_string()),
+            ("margin", "0".to_string()),
+        ] {
+            style.set_property(property, &value).ok();
+        }
+        document.body()?.append_child(&input).ok()?;
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let tx = Rc::new(RefCell::new(Some(tx)));
+        let finish = {
+            let (tx, input, inner) = (tx.clone(), input.clone(), self.inner.clone());
+            Rc::new(move |outcome: NativePickerOutcome| {
+                if let Some(tx) = tx.borrow_mut().take() {
+                    input.remove();
+                    inner.ime_mirror.focus();
+                    tx.send(outcome).ok();
+                }
+            })
+        };
+        let on_change = {
+            let (finish, input) = (finish.clone(), input.clone());
+            Closure::<dyn FnMut()>::new(move || {
+                let value = input.value();
+                finish(if value.is_empty() {
+                    NativePickerOutcome::Cleared
+                } else {
+                    NativePickerOutcome::Picked(value)
+                });
+            })
+        };
+        let on_close = {
+            let finish = finish.clone();
+            Closure::<dyn FnMut()>::new(move || finish(NativePickerOutcome::Dismissed))
+        };
+        let on_key = {
+            let finish = finish.clone();
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+                move |event: web_sys::KeyboardEvent| {
+                    if event.key() == "Escape" {
+                        finish(NativePickerOutcome::Dismissed);
+                    }
+                },
+            )
+        };
+        input
+            .add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref())
+            .ok();
+        for event in ["cancel", "blur"] {
+            input
+                .add_event_listener_with_callback(event, on_close.as_ref().unchecked_ref())
+                .ok();
+        }
+        input
+            .add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())
+            .ok();
+        // The input owns its listeners: the first outcome removes it.
+        on_change.forget();
+        on_close.forget();
+        on_key.forget();
+        input.focus().ok();
+        // `showPicker` throws without a user gesture; the focus above is
+        // the fallback, and what raises the picker on touch browsers.
+        input.show_picker().ok();
+        Some(rx)
+    }
+
     fn activate(&self) {
         self.inner.state.borrow_mut().is_active = true;
     }

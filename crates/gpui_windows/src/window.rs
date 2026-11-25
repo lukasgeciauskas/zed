@@ -720,6 +720,18 @@ impl PlatformWindow for WindowsWindow {
         self.state.input_handler.take()
     }
 
+    fn native_picker_supported(&self, _kind: gpui::NativePickerKind) -> bool {
+        true
+    }
+
+    // Astryx patch R16: Common Controls' month calendar and date-time picker.
+    fn show_native_picker(
+        &self,
+        request: gpui::NativePickerRequest,
+    ) -> Option<Receiver<gpui::NativePickerOutcome>> {
+        crate::native_picker::show(self.0.hwnd, self.scale_factor(), request)
+    }
+
     fn prompt(
         &self,
         level: PromptLevel,

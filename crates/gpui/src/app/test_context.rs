@@ -435,6 +435,23 @@ impl TestAppContext {
         self.test_platform.simulate_prompt_answer(button);
     }
 
+    /// Lets this app's windows open native date and time pickers, which a
+    /// test then answers with [`Self::simulate_native_picker`] (Astryx patch
+    /// R16). Off by default: a component then falls back to its own picker.
+    pub fn set_native_pickers_supported(&self, supported: bool) {
+        self.test_platform.set_native_pickers_supported(supported);
+    }
+
+    /// The native picker a window opened and nothing has answered yet.
+    pub fn native_picker_request(&self) -> Option<crate::NativePickerRequest> {
+        self.test_platform.native_picker_request()
+    }
+
+    /// Answers the open native picker.
+    pub fn simulate_native_picker(&self, outcome: crate::NativePickerOutcome) {
+        self.test_platform.simulate_native_picker(outcome);
+    }
+
     /// Returns true if there's an alert dialog open.
     pub fn has_pending_prompt(&self) -> bool {
         self.test_platform.has_pending_prompt()

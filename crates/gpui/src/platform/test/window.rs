@@ -484,6 +484,25 @@ impl PlatformWindow for TestWindow {
         )
     }
 
+    fn native_picker_supported(&self, _kind: crate::NativePickerKind) -> bool {
+        self.0
+            .lock()
+            .platform
+            .upgrade()
+            .is_some_and(|platform| platform.native_pickers.borrow().supported)
+    }
+
+    fn show_native_picker(
+        &self,
+        request: crate::NativePickerRequest,
+    ) -> Option<futures::channel::oneshot::Receiver<crate::NativePickerOutcome>> {
+        self.0
+            .lock()
+            .platform
+            .upgrade()
+            .and_then(|platform| platform.show_native_picker(request))
+    }
+
     fn activate(&self) {
         self.0
             .lock()

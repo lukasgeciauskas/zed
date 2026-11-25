@@ -1286,6 +1286,46 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// What a platform's own date and time picker edits (Astryx patch R16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativePickerKind {
+    /// A calendar day.
+    Date,
+    /// A time of day.
+    Time,
+    /// A day and a time of day.
+    DateTime,
+}
+
+/// A platform picker to open over a field (Astryx patch R16). Values are ISO:
+/// `2026-03-21`, `14:30` (or `14:30:05` with seconds), `2026-03-21T14:30`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativePickerRequest {
+    /// What the picker edits.
+    pub kind: NativePickerKind,
+    /// The value it opens on.
+    pub value: Option<String>,
+    /// The earliest value it offers.
+    pub min: Option<String>,
+    /// The latest value it offers.
+    pub max: Option<String>,
+    /// A time with seconds.
+    pub seconds: bool,
+    /// The field, in window coordinates: the picker opens at it.
+    pub anchor: Bounds<Pixels>,
+}
+
+/// How a platform picker closed (Astryx patch R16).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativePickerOutcome {
+    /// A value, ISO as in the request.
+    Picked(String),
+    /// The picker's own clear.
+    Cleared,
+    /// Closed without a value.
+    Dismissed,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -1333,6 +1373,20 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         detail: Option<&str>,
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
+    /// Whether this window can open the platform's own picker of `kind`
+    /// (Astryx patch R16).
+    fn native_picker_supported(&self, _kind: NativePickerKind) -> bool {
+        false
+    }
+    /// Opens the platform's own picker over `request.anchor`; the receiver
+    /// hears how it closed. `None` when the platform has none (Astryx patch
+    /// R16).
+    fn show_native_picker(
+        &self,
+        _request: NativePickerRequest,
+    ) -> Option<oneshot::Receiver<NativePickerOutcome>> {
+        None
+    }
     fn activate(&self);
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}

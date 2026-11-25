@@ -42,6 +42,8 @@ pub(crate) struct TestPlatform {
     current_find_pasteboard_item: Mutex<Option<ClipboardItem>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) prompts: RefCell<TestPrompts>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) native_pickers: RefCell<TestNativePickers>,
     screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
     pub opened_url: RefCell<Option<String>>,
     pub(crate) system_notifications: RefCell<TestSystemNotifications>,
@@ -110,6 +112,17 @@ pub(crate) struct TestSystemNotifications {
     pub(crate) delivered: Vec<SystemNotification>,
     pub(crate) dismissed: Vec<SharedString>,
     response_callback: Option<Box<dyn FnMut(SystemNotificationResponse)>>,
+}
+
+/// The native pickers of the test windows (Astryx patch R16).
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub(crate) struct TestNativePickers {
+    pub(crate) supported: bool,
+    pub(crate) pending: Option<(
+        crate::NativePickerRequest,
+        oneshot::Sender<crate::NativePickerOutcome>,
+    )>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -244,6 +257,8 @@ impl TestPlatform {
             foreground_executor,
             #[cfg(any(test, feature = "test-support"))]
             prompts: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            native_pickers: Default::default(),
             screen_capture_sources: Default::default(),
             active_cursor: Default::default(),
             displays: RefCell::new(vec![TestDisplay::new()]),
@@ -331,6 +346,46 @@ impl TestPlatform {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    /// Lets the test windows open native pickers (Astryx patch R16).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_native_pickers_supported(&self, supported: bool) {
+        self.native_pickers.borrow_mut().supported = supported;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn native_picker_request(&self) -> Option<crate::NativePickerRequest> {
+        self.native_pickers
+            .borrow()
+            .pending
+            .as_ref()
+            .map(|(request, _)| request.clone())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn show_native_picker(
+        &self,
+        request: crate::NativePickerRequest,
+    ) -> Option<oneshot::Receiver<crate::NativePickerOutcome>> {
+        let mut pickers = self.native_pickers.borrow_mut();
+        if !pickers.supported {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        pickers.pending = Some((request, tx));
+        Some(rx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn simulate_native_picker(&self, outcome: crate::NativePickerOutcome) {
+        let (_, tx) = self
+            .native_pickers
+            .borrow_mut()
+            .pending
+            .take()
+            .expect("no native picker is open");
+        tx.send(outcome).ok();
+    }
+
     pub(crate) fn has_pending_prompt(&self) -> bool {
         !self.prompts.borrow().multiple_choice.is_empty()
     }

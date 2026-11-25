@@ -7564,6 +7564,24 @@ impl Window {
         receiver
     }
 
+    /// Whether the platform has its own picker of `kind` (Astryx patch R16).
+    pub fn native_picker_supported(&self, kind: crate::NativePickerKind) -> bool {
+        self.platform_window.native_picker_supported(kind)
+    }
+
+    /// Opens the platform's own date or time picker over `request.anchor`
+    /// (Astryx patch R16). The receiver hears how it closed; `None` when the
+    /// platform has no picker of that kind, so the caller shows its own.
+    pub fn show_native_picker(
+        &self,
+        request: crate::NativePickerRequest,
+    ) -> Option<oneshot::Receiver<crate::NativePickerOutcome>> {
+        if !self.platform_window.native_picker_supported(request.kind) {
+            return None;
+        }
+        self.platform_window.show_native_picker(request)
+    }
+
     fn build_custom_prompt(
         &mut self,
         prompt_builder: &PromptBuilder,

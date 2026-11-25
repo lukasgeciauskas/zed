@@ -273,6 +273,10 @@ name = "astryx_inline"
 path = "examples/astryx_inline.rs"
 
 [[example]]
+name = "astryx_native_picker"
+path = "examples/astryx_native_picker.rs"
+
+[[example]]
 name = "svg"
 path = "examples/svg/svg.rs"
 
