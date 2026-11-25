@@ -1528,6 +1528,14 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Mark this element as the current one of a set (`aria-current`): the
+    /// current page of a trail or a pager, the current step of a flow, the
+    /// current date or location.
+    fn aria_current(mut self, current: accesskit::AriaCurrent) -> Self {
+        self.interactivity().aria.current = Some(current);
+        self
+    }
+
     /// Set the minimum numeric value for this element.
     fn aria_min_numeric_value(mut self, value: f64) -> Self {
         self.interactivity().aria.min_numeric_value = Some(value);
@@ -2269,6 +2277,8 @@ pub(crate) struct AriaProperties {
     pub(crate) busy: bool,
     pub(crate) modal: bool,
     pub(crate) multiselectable: bool,
+    // Astryx patch R9: aria-current.
+    pub(crate) current: Option<accesskit::AriaCurrent>,
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -3788,6 +3798,9 @@ impl Interactivity {
         if self.aria.multiselectable {
             node.set_multiselectable();
         }
+        if let Some(current) = self.aria.current {
+            node.set_aria_current(current);
+        }
         if !self.click_listeners.is_empty() {
             node.add_action(accesskit::Action::Click);
         }
@@ -4639,9 +4652,11 @@ mod tests {
             .aria_invalid(true)
             .aria_busy(true)
             .aria_modal(true)
-            .aria_multiselectable(true);
+            .aria_multiselectable(true)
+            .aria_current(accesskit::AriaCurrent::Step);
         let mut node = accesskit::Node::new(accesskit::Role::TextInput);
         el.interactivity().write_a11y_info(&mut node);
+        assert_eq!(node.aria_current(), Some(accesskit::AriaCurrent::Step));
         assert!(node.is_disabled());
         assert!(node.is_read_only());
         assert!(node.is_required());
@@ -4656,6 +4671,7 @@ mod tests {
         assert!(!node.is_disabled());
         assert!(!node.is_required());
         assert_eq!(node.invalid(), None);
+        assert_eq!(node.aria_current(), None);
     }
 
     use super::*;
