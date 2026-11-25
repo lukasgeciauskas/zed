@@ -395,6 +395,10 @@ pub(crate) struct A11yNodeBuilder {
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
     active_descendant: Option<NodeId>,
+    /// Astryx patch R15: nodes by the name `aria_id` gives them, and the
+    /// `aria-controls` relations to resolve at the end of the frame.
+    named: FxHashMap<SharedString, NodeId>,
+    controls: Vec<(NodeId, SmallVec<[SharedString; 2]>)>,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
 }
@@ -408,6 +412,8 @@ impl A11yNodeBuilder {
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
+            named: FxHashMap::default(),
+            controls: Vec::new(),
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
         }
@@ -488,6 +494,8 @@ impl A11yNodeBuilder {
         self.ids_stack.clear();
         self.nodes_stack.clear();
         self.seen_ids.clear();
+        self.named.clear();
+        self.controls.clear();
         #[cfg(debug_assertions)]
         self.node_info.clear();
         let mut root_node = accesskit::Node::new(accesskit::Role::Window);
@@ -499,6 +507,36 @@ impl A11yNodeBuilder {
         self.nodes_stack.push(root_node);
         self.focus = None;
         self.active_descendant = None;
+    }
+
+    /// Astryx patch R15: gives `id` a name relations can refer to.
+    pub(crate) fn name_node(&mut self, name: SharedString, id: NodeId) {
+        self.named.insert(name, id);
+    }
+
+    /// Astryx patch R15: `owner` controls the nodes named `names`.
+    pub(crate) fn relate_controls(&mut self, owner: NodeId, names: SmallVec<[SharedString; 2]>) {
+        self.controls.push((owner, names));
+    }
+
+    /// Astryx patch R15: sets each pending relation on its owner, with the
+    /// named nodes this frame built.
+    fn resolve_relations(&mut self) {
+        let controls = std::mem::take(&mut self.controls);
+        for (owner, names) in controls {
+            let ids: Vec<NodeId> = names
+                .iter()
+                .filter_map(|name| self.named.get(name).copied())
+                .filter(|id| self.has_node(*id))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            if let Some((_, node)) = self.all_nodes.iter_mut().find(|(id, _)| *id == owner) {
+                node.set_controls(ids);
+            }
+        }
+        self.named.clear();
     }
 
     /// Returns whether a node with the given ID has been pushed in this frame.
@@ -572,6 +610,7 @@ impl A11yNodeBuilder {
                 self.all_nodes.push((id, node));
             }
         }
+        self.resolve_relations();
 
         let focus = match self.active_descendant {
             Some(id) if self.has_node(id) => id,
@@ -681,6 +720,52 @@ mod tests {
                 assert_eq!(a11y.is_active(), !force_disabled && active);
             }
         }
+    }
+
+    /// Astryx patch R15: `aria-controls` names nodes by their `aria_id`,
+    /// wherever they come in the frame; unknown names are skipped.
+    #[test]
+    fn controls_resolve_names_at_the_end_of_the_frame() {
+        let mut builder = new_builder();
+        let button = NodeId(1);
+        let (first, second) = (NodeId(2), NodeId(3));
+        assert!(builder.push(button, test_node()));
+        builder.relate_controls(
+            button,
+            ["a".into(), "missing".into(), "b".into()]
+                .into_iter()
+                .collect(),
+        );
+        builder.pop();
+        for (id, name) in [(first, "a"), (second, "b")] {
+            assert!(builder.push(id, test_node()));
+            builder.name_node(name.into(), id);
+            builder.pop();
+        }
+        let update = builder.finalize();
+        let node = |id| {
+            update
+                .nodes
+                .iter()
+                .find(|(n, _)| *n == id)
+                .map(|(_, node)| node)
+                .unwrap()
+        };
+        assert_eq!(node(button).controls(), [first, second]);
+        assert!(node(first).controls().is_empty());
+
+        // A new frame forgets the names.
+        let mut builder = new_builder();
+        assert!(builder.push(button, test_node()));
+        builder.relate_controls(button, ["a".into()].into_iter().collect());
+        builder.pop();
+        let update = builder.finalize();
+        assert!(
+            update
+                .nodes
+                .iter()
+                .all(|(_, node)| node.controls().is_empty())
+        );
     }
 
     #[test]

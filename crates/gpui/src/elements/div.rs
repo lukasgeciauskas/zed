@@ -1544,6 +1544,22 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Astryx patch R15: names this element's accessibility node, as an HTML
+    /// `id` does, so another element's relation can point at it. Names are
+    /// per frame and should be unique in the window.
+    fn aria_id(mut self, name: impl Into<SharedString>) -> Self {
+        self.interactivity().a11y_name = Some(name.into());
+        self
+    }
+
+    /// Astryx patch R15: the elements this one controls (`aria-controls`),
+    /// by the names their `aria_id` gives. A name no node has this frame is
+    /// skipped.
+    fn aria_controls(mut self, names: impl IntoIterator<Item = impl Into<SharedString>>) -> Self {
+        self.interactivity().aria_controls = names.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Report this element as the active descendant of the element that
     /// tracks `focus` (`aria-activedescendant`), while that element holds
     /// focus, wherever this element sits in the tree: the options of a
@@ -2393,6 +2409,10 @@ pub struct Interactivity {
     pub(crate) report_active_descendant_focus: bool,
     // Astryx patch R13: the active descendant of an element elsewhere.
     pub(crate) active_descendant_of: Option<FocusHandle>,
+    // Astryx patch R15: a name other elements' relations refer to, and the
+    // named elements this one controls (`aria-controls`).
+    pub(crate) a11y_name: Option<SharedString>,
+    pub(crate) aria_controls: SmallVec<[SharedString; 2]>,
     pub(crate) override_role: Option<accesskit::Role>,
     pub(crate) aria: AriaProperties,
 
@@ -2558,6 +2578,22 @@ impl Interactivity {
             window
                 .a11y
                 .set_active_descendant_of_focused(global_id.accesskit_node_id());
+        }
+        // Astryx patch R15: names and the relations that use them resolve
+        // when the frame's tree is finished.
+        if window.a11y.is_active()
+            && let Some(global_id) = global_id
+        {
+            let node_id = global_id.accesskit_node_id();
+            if let Some(name) = self.a11y_name.clone() {
+                window.a11y.nodes.name_node(name, node_id);
+            }
+            if !self.aria_controls.is_empty() {
+                window
+                    .a11y
+                    .nodes
+                    .relate_controls(node_id, self.aria_controls.clone());
+            }
         }
         window.with_optional_element_state::<InteractiveElementState, _>(
             global_id,
