@@ -324,6 +324,22 @@ pub struct Style {
     /// The grid location of this element
     pub grid_location: Option<GridLocation>,
 
+    /// Explicit column tracks, CSS `grid-template-columns` (Astryx patch R7). When set,
+    /// it replaces `grid_cols`.
+    pub grid_template_columns: Option<Vec<GridTrack>>,
+
+    /// Explicit row tracks, CSS `grid-template-rows`. When set, it replaces `grid_rows`.
+    pub grid_template_rows: Option<Vec<GridTrack>>,
+
+    /// How auto-placed items fill the grid, CSS `grid-auto-flow`.
+    pub grid_auto_flow: Option<GridAutoFlow>,
+
+    /// The size of implicitly created columns, CSS `grid-auto-columns`.
+    pub grid_auto_columns: Option<Vec<GridTrack>>,
+
+    /// The size of implicitly created rows, CSS `grid-auto-rows`.
+    pub grid_auto_rows: Option<Vec<GridTrack>>,
+
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -843,6 +859,11 @@ impl Default for Style {
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
+            grid_template_columns: None,
+            grid_template_rows: None,
+            grid_auto_flow: None,
+            grid_auto_columns: None,
+            grid_auto_rows: None,
 
             #[cfg(debug_assertions)]
             debug: false,
@@ -1183,6 +1204,10 @@ pub enum Display {
     /// An inline-level box whose children follow the grid layout: CSS `inline-grid`.
     /// See [`Display::InlineBlock`] for how inline-level boxes flow.
     InlineGrid,
+    /// No box of its own: its children are laid out as children of its parent, CSS
+    /// `display: contents` (Astryx patch R7). Its bounds are the union of its
+    /// children's, so it still paints and receives events over them.
+    Contents,
 }
 
 impl Display {
@@ -1343,7 +1368,8 @@ impl From<Display> for taffy::style::Display {
             Display::Block | Display::InlineBlock => Self::Block,
             Display::Flex | Display::InlineFlex => Self::Flex,
             Display::Grid | Display::InlineGrid => Self::Grid,
-            Display::None => Self::None,
+            // A contents node is never attached to the tree; its children are.
+            Display::None | Display::Contents => Self::None,
         }
     }
 }
@@ -1586,5 +1612,50 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+}
+
+/// One grid track size, a CSS `<track-size>` (Astryx patch R7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum GridTrack {
+    /// `auto`: as large as its content, stretching into free space.
+    Auto,
+    /// `min-content`.
+    MinContent,
+    /// `max-content`.
+    MaxContent,
+    /// A fixed length.
+    Length(AbsoluteLength),
+    /// A share of the free space, `<n>fr`.
+    Fr(f32),
+    /// `minmax(min, max)`. A flexible (`fr`) minimum is not allowed in CSS and acts as
+    /// `auto`.
+    MinMax(Box<GridTrack>, Box<GridTrack>),
+    /// `fit-content(limit)`.
+    FitContent(AbsoluteLength),
+}
+
+/// How auto-placed grid items fill the grid, CSS `grid-auto-flow` (Astryx patch R7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum GridAutoFlow {
+    /// Fill each row in turn.
+    #[default]
+    Row,
+    /// Fill each column in turn.
+    Column,
+    /// Fill rows, back-filling holes.
+    RowDense,
+    /// Fill columns, back-filling holes.
+    ColumnDense,
+}
+
+impl From<GridAutoFlow> for taffy::style::GridAutoFlow {
+    fn from(value: GridAutoFlow) -> Self {
+        match value {
+            GridAutoFlow::Row => Self::Row,
+            GridAutoFlow::Column => Self::Column,
+            GridAutoFlow::RowDense => Self::RowDense,
+            GridAutoFlow::ColumnDense => Self::ColumnDense,
+        }
     }
 }

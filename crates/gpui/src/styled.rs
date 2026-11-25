@@ -1,9 +1,9 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, point, px, relative, rems,
+    FontWeight, GridAutoFlow, GridPlacement, GridTemplate, GridTemplateMinSize, GridTrack, Hsla,
+    JustifyContent, Length, SharedString, StrikethroughStyle, StyleRefinement, TextAlign,
+    TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace, point, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -851,6 +851,44 @@ pub trait Styled: Sized {
     /// `(0.5, 0.5)`.
     fn transform_origin(mut self, x: f32, y: f32) -> Self {
         self.style().transform_origin = Some(point(x, y));
+        self
+    }
+
+    /// Lays this element's children out as children of its parent, with no box of its
+    /// own: CSS `display: contents` (Astryx patch R7).
+    fn display_contents(mut self) -> Self {
+        self.style().display = Some(Display::Contents);
+        self
+    }
+
+    /// Sets explicit column tracks, CSS `grid-template-columns` (Astryx patch R7):
+    /// `[GridTrack::Auto, GridTrack::Fr(1.)]` is `auto 1fr`.
+    fn grid_template_columns(mut self, tracks: impl IntoIterator<Item = GridTrack>) -> Self {
+        self.style().grid_template_columns = Some(tracks.into_iter().collect());
+        self
+    }
+
+    /// Sets explicit row tracks, CSS `grid-template-rows` (Astryx patch R7).
+    fn grid_template_rows(mut self, tracks: impl IntoIterator<Item = GridTrack>) -> Self {
+        self.style().grid_template_rows = Some(tracks.into_iter().collect());
+        self
+    }
+
+    /// Sets how auto-placed items fill the grid, CSS `grid-auto-flow` (Astryx patch R7).
+    fn grid_auto_flow(mut self, flow: GridAutoFlow) -> Self {
+        self.style().grid_auto_flow = Some(flow);
+        self
+    }
+
+    /// Sizes implicitly created columns, CSS `grid-auto-columns` (Astryx patch R7).
+    fn grid_auto_columns(mut self, tracks: impl IntoIterator<Item = GridTrack>) -> Self {
+        self.style().grid_auto_columns = Some(tracks.into_iter().collect());
+        self
+    }
+
+    /// Sizes implicitly created rows, CSS `grid-auto-rows` (Astryx patch R7).
+    fn grid_auto_rows(mut self, tracks: impl IntoIterator<Item = GridTrack>) -> Self {
+        self.style().grid_auto_rows = Some(tracks.into_iter().collect());
         self
     }
 

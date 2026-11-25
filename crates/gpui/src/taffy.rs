@@ -149,6 +149,10 @@ pub struct TaffyLayoutEngine {
     /// node, stamped with the frame that set them so a node reused by another element
     /// never inherits one.
     baselines: SecondaryMap<DefaultKey, (u64, f32)>,
+    /// The children of `display: contents` nodes (Astryx patch R7), stamped with the
+    /// frame that requested them. A contents node is never attached to the tree: its
+    /// children are attached to its parent in its place.
+    contents: SecondaryMap<DefaultKey, (u64, SmallVec<[LayoutId; 8]>)>,
 }
 
 /// Layout nodes requested by elements under one element ID path, in request order.
@@ -204,6 +208,7 @@ impl TaffyLayoutEngine {
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
             baselines: SecondaryMap::new(),
+            contents: SecondaryMap::new(),
         }
     }
 
@@ -255,6 +260,21 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
+        // A `display: contents` child stands for its own children.
+        let expanded;
+        let children = if children.iter().any(|&child| self.is_contents(child)) {
+            expanded = self.expand_contents(children);
+            expanded.as_slice()
+        } else {
+            children
+        };
+        if style.display == Display::Contents {
+            let id = self.acquire_node(scope, style, rem_size, scale_factor, &[]);
+            let frame = self.cache.frame;
+            self.contents
+                .insert(node_key(id), (frame, children.iter().copied().collect()));
+            return id.into();
+        }
         let lines;
         let children = if style.display.is_block_container()
             && children.iter().any(|&child| self.is_inline_level(child))
@@ -269,6 +289,28 @@ impl TaffyLayoutEngine {
             self.taffy.mark_dirty(id).expect(EXPECT_MESSAGE);
         }
         id.into()
+    }
+
+    /// Whether a node is a `display: contents` node requested this frame.
+    fn is_contents(&self, id: LayoutId) -> bool {
+        self.contents
+            .get(node_key(id.0))
+            .is_some_and(|(frame, _)| *frame == self.cache.frame)
+    }
+
+    /// Replaces each `display: contents` node with its children (already expanded when
+    /// it was requested, since children are requested before their parents).
+    fn expand_contents(&self, children: &[LayoutId]) -> SmallVec<[LayoutId; 8]> {
+        let mut expanded = SmallVec::new();
+        for &child in children {
+            match self.contents.get(node_key(child.0)) {
+                Some((frame, inner)) if *frame == self.cache.frame => {
+                    expanded.extend(inner.iter().copied())
+                }
+                _ => expanded.push(child),
+            }
+        }
+        expanded
     }
 
     /// Whether a node is an in-flow inline-level box (`inline-block`, `inline-flex` or
@@ -743,6 +785,19 @@ impl TaffyLayoutEngine {
         if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
             return layout;
         }
+        // A `display: contents` node has no box: it covers its children.
+        if let Some((frame, children)) = self.contents.get(node_key(id.0))
+            && *frame == self.cache.frame
+        {
+            let children = children.clone();
+            let bounds = children
+                .iter()
+                .map(|&child| self.layout_bounds(child, scale_factor))
+                .reduce(|a, b| a.union(&b))
+                .unwrap_or_default();
+            self.absolute_layout_bounds.insert(id, bounds);
+            return bounds;
+        }
 
         let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
         let layout_location = layout.location;
@@ -924,6 +979,11 @@ layout_style! {
     grid_rows: Option<GridTemplate>,
     grid_cols: Option<GridTemplate>,
     grid_location: Option<crate::GridLocation>,
+    grid_template_columns: Option<Vec<crate::GridTrack>>,
+    grid_template_rows: Option<Vec<crate::GridTrack>>,
+    grid_auto_flow: Option<crate::GridAutoFlow>,
+    grid_auto_columns: Option<Vec<crate::GridTrack>>,
+    grid_auto_rows: Option<Vec<crate::GridTrack>>,
 }
 
 impl LayoutStyle {
@@ -996,8 +1056,33 @@ impl LayoutStyle {
             flex_basis: self.flex_basis.to_taffy(rem_size, scale_factor),
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
-            grid_template_rows: to_grid_repeat(&self.grid_rows),
-            grid_template_columns: to_grid_repeat(&self.grid_cols),
+            grid_template_rows: match &self.grid_template_rows {
+                Some(tracks) => tracks
+                    .iter()
+                    .map(|t| taffy::GridTemplateComponent::Single(track(t, rem_size, scale_factor)))
+                    .collect(),
+                None => to_grid_repeat(&self.grid_rows),
+            },
+            grid_template_columns: match &self.grid_template_columns {
+                Some(tracks) => tracks
+                    .iter()
+                    .map(|t| taffy::GridTemplateComponent::Single(track(t, rem_size, scale_factor)))
+                    .collect(),
+                None => to_grid_repeat(&self.grid_cols),
+            },
+            grid_auto_flow: self.grid_auto_flow.map(Into::into).unwrap_or_default(),
+            grid_auto_columns: self
+                .grid_auto_columns
+                .iter()
+                .flatten()
+                .map(|t| track(t, rem_size, scale_factor))
+                .collect(),
+            grid_auto_rows: self
+                .grid_auto_rows
+                .iter()
+                .flatten()
+                .map(|t| track(t, rem_size, scale_factor))
+                .collect(),
             grid_row: self
                 .grid_location
                 .as_ref()
@@ -1010,6 +1095,53 @@ impl LayoutStyle {
                 .unwrap_or_default(),
             ..Default::default()
         }
+    }
+}
+
+/// A grid track as Taffy's track sizing function (Astryx patch R7).
+fn track(
+    track: &crate::GridTrack,
+    rem_size: Pixels,
+    scale_factor: f32,
+) -> taffy::style::TrackSizingFunction {
+    use crate::GridTrack;
+    use taffy::style::{MaxTrackSizingFunction, MinTrackSizingFunction};
+    use taffy::style_helpers::{auto, fit_content, fr, length, max_content, min_content, minmax};
+
+    fn min_of(track: &GridTrack, rem_size: Pixels, scale_factor: f32) -> MinTrackSizingFunction {
+        match track {
+            GridTrack::MinContent => min_content(),
+            GridTrack::MaxContent => max_content(),
+            GridTrack::Length(l) => length(ToTaffy::<f32>::to_taffy(l, rem_size, scale_factor)),
+            _ => auto(),
+        }
+    }
+    fn max_of(track: &GridTrack, rem_size: Pixels, scale_factor: f32) -> MaxTrackSizingFunction {
+        match track {
+            GridTrack::MinContent => min_content(),
+            GridTrack::MaxContent => max_content(),
+            GridTrack::Length(l) => length(ToTaffy::<f32>::to_taffy(l, rem_size, scale_factor)),
+            GridTrack::Fr(f) => fr(*f),
+            GridTrack::FitContent(l) => {
+                fit_content(length(ToTaffy::<f32>::to_taffy(l, rem_size, scale_factor)))
+            }
+            _ => auto(),
+        }
+    }
+    match track {
+        GridTrack::MinMax(min, max) => minmax(
+            min_of(min, rem_size, scale_factor),
+            max_of(max, rem_size, scale_factor),
+        ),
+        GridTrack::Fr(f) => minmax(auto(), fr(*f)),
+        GridTrack::FitContent(l) => minmax(
+            auto(),
+            fit_content(length(ToTaffy::<f32>::to_taffy(l, rem_size, scale_factor))),
+        ),
+        other => minmax(
+            min_of(other, rem_size, scale_factor),
+            max_of(other, rem_size, scale_factor),
+        ),
     }
 }
 
@@ -1943,5 +2075,90 @@ mod tests {
             })
             .collect();
         assert_frames_match_uncached(cx, frames);
+    }
+
+    // Display contents and grid tracks (Astryx patch R7).
+
+    fn sized(name: &'static str, width: f32, height: f32) -> impl IntoElement {
+        div()
+            .w(px(width))
+            .h(px(height))
+            .debug_selector(move || name.to_string())
+    }
+
+    #[crate::test]
+    fn contents_children_become_grid_items(cx: &mut TestAppContext) {
+        use crate::GridTrack;
+        // `auto 1fr` over two contents rows: the label column is as wide as the
+        // widest label, and every control starts after it.
+        // Nested, so the grid is as tall as its rows rather than the window.
+        let bounds = draw_once(cx, |_| {
+            div()
+                .child(
+                    div()
+                        .w(px(400.))
+                        .grid()
+                        .grid_template_columns([GridTrack::Auto, GridTrack::Fr(1.)])
+                        .child(
+                            div()
+                                .display_contents()
+                                .debug_selector(|| "row-a".into())
+                                .child(sized("label-a", 40., 20.))
+                                .child(div().h(px(30.)).debug_selector(|| "control-a".into())),
+                        )
+                        .child(
+                            div()
+                                .display_contents()
+                                .child(sized("label-b", 90., 20.))
+                                .child(div().h(px(30.)).debug_selector(|| "control-b".into())),
+                        ),
+                )
+                .into_any_element()
+        });
+        assert_eq!(bounds["control-a"].origin, point(px(90.), px(0.)));
+        assert_eq!(bounds["control-b"].origin, point(px(90.), px(30.)));
+        assert_eq!(bounds["control-a"].size.width, px(310.));
+        // The contents node covers its children.
+        assert_eq!(
+            bounds["row-a"],
+            Bounds::new(point(px(0.), px(0.)), size(px(400.), px(30.)))
+        );
+    }
+
+    #[crate::test]
+    fn auto_flow_columns_share_the_width(cx: &mut TestAppContext) {
+        use crate::{GridAutoFlow, GridTrack};
+        let bounds = draw_once(cx, |_| {
+            div()
+                .w(px(300.))
+                .grid()
+                .grid_auto_flow(GridAutoFlow::Column)
+                .grid_auto_columns([GridTrack::Fr(1.)])
+                .child(sized("a", 10., 10.))
+                .child(div().h(px(10.)).debug_selector(|| "b".into()))
+                .child(div().h(px(10.)).debug_selector(|| "c".into()))
+                .into_any_element()
+        });
+        assert_eq!(bounds["b"].origin.x, px(100.));
+        assert_eq!(bounds["c"].origin.x, px(200.));
+    }
+
+    #[crate::test]
+    fn nested_contents_flatten(cx: &mut TestAppContext) {
+        let bounds = draw_once(cx, |_| {
+            div()
+                .flex()
+                .flex_row()
+                .child(sized("a", 10., 10.))
+                .child(
+                    div()
+                        .display_contents()
+                        .child(div().display_contents().child(sized("b", 20., 10.)))
+                        .child(sized("c", 30., 10.)),
+                )
+                .into_any_element()
+        });
+        assert_eq!(bounds["b"].origin.x, px(10.));
+        assert_eq!(bounds["c"].origin.x, px(30.));
     }
 }
