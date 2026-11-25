@@ -1,11 +1,11 @@
 use std::{collections::HashMap, rc::Rc};
 
 use gpui::{
-    Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
-    Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
-    Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, ScrollSource, TouchEvent, TouchId,
-    TouchPhase, point, px,
+    Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, ExternalPaths,
+    FileDropEvent, GestureTuning, Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, NavigationDirection, Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent,
+    ScrollSource, TouchEvent, TouchId, TouchPhase, point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -155,6 +155,7 @@ impl WebWindowInner {
             self.register_wheel(),
             self.register_context_menu(),
             self.register_dragover(),
+            self.register_dragleave(),
             self.register_drop(),
             self.register_key_down(),
             self.register_key_up(),
@@ -689,23 +690,66 @@ impl WebWindowInner {
         })
     }
 
-    /// Browsers only expose dropped files as `File` objects, never as
-    /// filesystem paths, so no `FileDrop` input can be synthesized: GPUI's
-    /// `ExternalPaths` consumers would try to read paths that don't exist.
-    /// The events are still intercepted so the browser doesn't navigate to
-    /// the dropped file. Delivering actual file drops would require plumbing
-    /// `File` contents through a web-specific channel.
+    /// Files dragged from the system (Astryx patch R8). Browsers hand the
+    /// `File` objects over only at the drop, so the drag starts with no paths
+    /// (enough for `drag_over::<ExternalPaths>` styling), and at the drop the
+    /// files get virtual paths (`crate::web_files`) and replace the empty list
+    /// before the drop lands.
     fn register_dragover(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
         self.listen("dragover", move |event: JsValue| {
             let event: web_sys::DragEvent = event.unchecked_into();
             event.prevent_default();
+            if !carries_files(&event) {
+                return;
+            }
+            if let Some(transfer) = event.data_transfer() {
+                transfer.set_drop_effect("copy");
+            }
+            let position = mouse_position_in_element(&event);
+            let input = if this.file_drag.replace(true) {
+                FileDropEvent::Pending { position }
+            } else {
+                FileDropEvent::Entered {
+                    position,
+                    paths: ExternalPaths(Default::default()),
+                }
+            };
+            this.dispatch_input(PlatformInput::FileDrop(input));
+        })
+    }
+
+    fn register_dragleave(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        self.listen("dragleave", move |_event: JsValue| {
+            if this.file_drag.replace(false) {
+                this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+            }
         })
     }
 
     fn register_drop(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
         self.listen("drop", move |event: JsValue| {
             let event: web_sys::DragEvent = event.unchecked_into();
             event.prevent_default();
+            let paths = event
+                .data_transfer()
+                .and_then(|transfer| transfer.files())
+                .map(|files| crate::web_files::register_list(&files))
+                .unwrap_or_default();
+            let position = mouse_position_in_element(&event);
+            if this.file_drag.replace(false) {
+                this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Exited));
+            }
+            if paths.is_empty() {
+                return;
+            }
+            this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Entered {
+                position,
+                paths: ExternalPaths(paths.into_iter().collect()),
+            }));
+            this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Submit { position }));
         })
     }
 
@@ -1473,6 +1517,14 @@ fn predicted_pointer_position(
         position.x + px((predicted.client_x() - event.client_x()) as f32 * scale),
         position.y + px((predicted.client_y() - event.client_y()) as f32 * scale),
     ))
+}
+
+/// Whether a drag carries files from the system.
+fn carries_files(event: &web_sys::DragEvent) -> bool {
+    event.data_transfer().is_some_and(|transfer| {
+        let types = transfer.types();
+        (0..types.length()).any(|i| types.get(i).as_string().as_deref() == Some("Files"))
+    })
 }
 
 fn mouse_position_in_element(event: &web_sys::MouseEvent) -> Point<Pixels> {

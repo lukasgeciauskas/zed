@@ -64,6 +64,8 @@ pub(crate) struct WebWindowInner {
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) touch_ids: RefCell<TouchIds>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
+    /// Files are being dragged over the canvas (Astryx patch R8).
+    pub(crate) file_drag: Cell<bool>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
@@ -217,6 +219,7 @@ impl WebWindow {
             click_state: RefCell::new(ClickState::default()),
             touch_ids: RefCell::new(TouchIds::default()),
             pressed_button: Cell::new(None),
+            file_drag: Cell::new(false),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),

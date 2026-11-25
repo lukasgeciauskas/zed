@@ -34,6 +34,8 @@ mod text_system;
 #[cfg(target_family = "wasm")]
 mod viewport;
 #[cfg(target_family = "wasm")]
+pub mod web_files;
+#[cfg(target_family = "wasm")]
 mod window;
 
 #[cfg(target_family = "wasm")]

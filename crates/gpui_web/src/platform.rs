@@ -475,15 +475,74 @@ impl Platform for WebPlatform {
         Task::ready(Ok(()))
     }
 
+    /// The browser's file dialog, through a hidden `<input type="file">`
+    /// (Astryx patch R8). The chosen files get virtual paths
+    /// (`crate::web_files`). Browsers open the dialog only during a user
+    /// gesture, so call it from a click or key handler.
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        use wasm_bindgen::JsCast as _;
+        use wasm_bindgen::closure::Closure;
+
         let (tx, rx) = oneshot::channel();
-        tx.send(Err(anyhow::anyhow!(
-            "prompt_for_paths is not supported on the web"
-        )))
-        .ok();
+        let input = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.create_element("input").ok())
+            .and_then(|element| element.dyn_into::<web_sys::HtmlInputElement>().ok());
+        let Some(input) = input else {
+            tx.send(Err(anyhow::anyhow!("no document to open a file dialog in")))
+                .ok();
+            return rx;
+        };
+        input.set_type("file");
+        input.set_multiple(options.multiple);
+        if options.directories && !options.files {
+            input.set_attribute("webkitdirectory", "").ok();
+        }
+        input.style().set_property("display", "none").ok();
+        if let Some(body) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.body())
+        {
+            body.append_child(&input).ok();
+        }
+
+        let tx = std::rc::Rc::new(std::cell::RefCell::new(Some(tx)));
+        let on_change = {
+            let (tx, input) = (tx.clone(), input.clone());
+            Closure::<dyn FnMut()>::new(move || {
+                let paths = input
+                    .files()
+                    .map(|files| crate::web_files::register_list(&files))
+                    .unwrap_or_default();
+                input.remove();
+                if let Some(tx) = tx.borrow_mut().take() {
+                    tx.send(Ok((!paths.is_empty()).then_some(paths))).ok();
+                }
+            })
+        };
+        let on_cancel = {
+            let (tx, input) = (tx.clone(), input.clone());
+            Closure::<dyn FnMut()>::new(move || {
+                input.remove();
+                if let Some(tx) = tx.borrow_mut().take() {
+                    tx.send(Ok(None)).ok();
+                }
+            })
+        };
+        input
+            .add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref())
+            .ok();
+        input
+            .add_event_listener_with_callback("cancel", on_cancel.as_ref().unchecked_ref())
+            .ok();
+        // The input owns its listeners from here: each fires at most once and
+        // the input is removed after.
+        on_change.forget();
+        on_cancel.forget();
+        input.click();
         rx
     }
 
