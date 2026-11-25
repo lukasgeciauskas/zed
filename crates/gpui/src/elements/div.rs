@@ -849,6 +849,14 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Designate this element a focus trap: Tab and Shift-Tab that start on
+    /// a tab stop inside it cycle among its tab stops, as in a modal dialog
+    /// (Astryx patch R12). A Tab that starts outside passes over it in order.
+    fn tab_trap(mut self) -> Self {
+        self.interactivity().tab_trap = true;
+        self
+    }
+
     /// Set the keymap context for this element. This will be used to determine
     /// which action to dispatch from the keymap.
     fn key_context<C, E>(mut self, key_context: C) -> Self
@@ -1533,6 +1541,14 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// current date or location.
     fn aria_current(mut self, current: accesskit::AriaCurrent) -> Self {
         self.interactivity().aria.current = Some(current);
+        self
+    }
+
+    /// Mark this element as the trigger of a popup of `kind`
+    /// (`aria-haspopup`): a dialog, menu, listbox, tree or grid (Astryx
+    /// patch R12).
+    fn aria_has_popup(mut self, kind: accesskit::HasPopup) -> Self {
+        self.interactivity().aria.has_popup = Some(kind);
         self
     }
 
@@ -2279,6 +2295,8 @@ pub(crate) struct AriaProperties {
     pub(crate) multiselectable: bool,
     // Astryx patch R9: aria-current.
     pub(crate) current: Option<accesskit::AriaCurrent>,
+    // Astryx patch R12: the kind of popup a trigger opens.
+    pub(crate) has_popup: Option<accesskit::HasPopup>,
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -2343,6 +2361,8 @@ pub struct Interactivity {
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
+    /// Astryx patch R12: a focus trap.
+    pub(crate) tab_trap: bool,
     pub(crate) tab_stop: bool,
 
     pub(crate) a11y_action_listeners:
@@ -2718,7 +2738,7 @@ impl Interactivity {
                                 window.with_content_mask(
                                     style.overflow_mask(bounds, window.rem_size()),
                                     |window| {
-                                        window.with_tab_group(tab_group, |window| {
+                                        window.with_tab_scope(tab_group, self.tab_trap, |window| {
                                             // Register the container's own focus handle *inside* its
                                             // tab group, so that focusing the container and then
                                             // calling `focus_next` descends into this group's first
@@ -3801,6 +3821,9 @@ impl Interactivity {
         if let Some(current) = self.aria.current {
             node.set_aria_current(current);
         }
+        if let Some(kind) = self.aria.has_popup {
+            node.set_has_popup(kind);
+        }
         if !self.click_listeners.is_empty() {
             node.add_action(accesskit::Action::Click);
         }
@@ -4653,10 +4676,12 @@ mod tests {
             .aria_busy(true)
             .aria_modal(true)
             .aria_multiselectable(true)
-            .aria_current(accesskit::AriaCurrent::Step);
+            .aria_current(accesskit::AriaCurrent::Step)
+            .aria_has_popup(accesskit::HasPopup::Dialog);
         let mut node = accesskit::Node::new(accesskit::Role::TextInput);
         el.interactivity().write_a11y_info(&mut node);
         assert_eq!(node.aria_current(), Some(accesskit::AriaCurrent::Step));
+        assert_eq!(node.has_popup(), Some(accesskit::HasPopup::Dialog));
         assert!(node.is_disabled());
         assert!(node.is_read_only());
         assert!(node.is_required());

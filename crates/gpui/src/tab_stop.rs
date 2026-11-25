@@ -17,6 +17,9 @@ pub(crate) struct TabStopMap {
     by_id: FxHashMap<FocusId, usize>,
     nodes: Vec<TabStopNode>,
     sorted: bool,
+    /// Astryx patch R12: focus traps, as ranges of `insertion_history`.
+    traps: Vec<std::ops::Range<usize>>,
+    trap_starts: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +27,9 @@ pub enum TabStopOperation {
     Insert(FocusHandle),
     Group(TabIndex),
     GroupEnd,
+    /// Astryx patch R12: the start and end of a focus trap.
+    Trap,
+    TrapEnd,
 }
 
 impl TabStopOperation {
@@ -93,36 +99,74 @@ impl TabStopMap {
         self.current_path.0.pop();
     }
 
+    /// Starts a focus trap: Tab and Shift-Tab from a stop inserted before
+    /// the matching [`Self::end_trap`] stay among the trap's stops (Astryx
+    /// patch R12).
+    pub fn begin_trap(&mut self) {
+        self.insertion_history.push(TabStopOperation::Trap);
+        self.trap_starts.push(self.insertion_history.len());
+    }
+
+    /// Ends the innermost open focus trap.
+    pub fn end_trap(&mut self) {
+        if let Some(start) = self.trap_starts.pop() {
+            self.traps.push(start..self.insertion_history.len());
+        }
+        self.insertion_history.push(TabStopOperation::TrapEnd);
+    }
+
+    /// The innermost trap holding the node at `position`, if any.
+    fn trap_of(&self, position: usize) -> Option<std::ops::Range<usize>> {
+        let insertion = self.nodes.get(position)?.node_insertion_index;
+        self.traps
+            .iter()
+            .filter(|trap| trap.contains(&insertion))
+            .min_by_key(|trap| trap.len())
+            .cloned()
+    }
+
     pub fn clear(&mut self) {
         self.current_path.0.clear();
         self.insertion_history.clear();
         self.by_id.clear();
         self.nodes.clear();
         self.sorted = false;
+        self.traps.clear();
+        self.trap_starts.clear();
     }
 
     pub fn next(&mut self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
         self.ensure_sorted();
-        let start = focused_id
-            .and_then(|id| self.by_id.get(id))
-            .map_or(0, |position| position + 1);
+        let focused = focused_id.and_then(|id| self.by_id.get(id)).copied();
+        let start = focused.map_or(0, |position| position + 1);
+        let trap = focused.and_then(|position| self.trap_of(position));
         let node = self.nodes[start..]
             .iter()
             .chain(&self.nodes[..start])
-            .find(|node| node.tab_stop)?;
+            .find(|node| {
+                node.tab_stop
+                    && trap
+                        .as_ref()
+                        .is_none_or(|trap| trap.contains(&node.node_insertion_index))
+            })?;
         self.focus_handle_for_order(node)
     }
 
     pub fn prev(&mut self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
         self.ensure_sorted();
-        let end = focused_id
-            .and_then(|id| self.by_id.get(id).copied())
-            .unwrap_or(self.nodes.len());
+        let focused = focused_id.and_then(|id| self.by_id.get(id).copied());
+        let end = focused.unwrap_or(self.nodes.len());
+        let trap = focused.and_then(|position| self.trap_of(position));
         let node = self.nodes[..end]
             .iter()
             .rev()
             .chain(self.nodes[end..].iter().rev())
-            .find(|node| node.tab_stop)?;
+            .find(|node| {
+                node.tab_stop
+                    && trap
+                        .as_ref()
+                        .is_none_or(|trap| trap.contains(&node.node_insertion_index))
+            })?;
         self.focus_handle_for_order(node)
     }
 
@@ -156,6 +200,8 @@ impl TabStopMap {
                 TabStopOperation::Insert(focus_handle) => self.insert(focus_handle),
                 TabStopOperation::Group(tab_index) => self.begin_group(*tab_index),
                 TabStopOperation::GroupEnd => self.end_group(),
+                TabStopOperation::Trap => self.begin_trap(),
+                TabStopOperation::TrapEnd => self.end_trap(),
             }
         }
     }
@@ -424,6 +470,37 @@ mod tests {
             .tab_stop(3, 1)
             .tab_non_stop(4)
             .assert();
+    }
+
+    /// Astryx patch R12: Tab and Shift-Tab from inside a trap cycle among
+    /// its stops; from outside, they pass over it in order.
+    #[test]
+    fn test_tab_trap() {
+        let focus_map = Arc::new(RwLock::new(FocusMap::default()));
+        let mut map = TabStopMap::default();
+        let stop = |index: isize| FocusHandle::new(&focus_map).tab_stop(true).tab_index(index);
+        let (before, first, second, after) = (stop(0), stop(0), stop(0), stop(0));
+        map.insert(&before);
+        map.begin_trap();
+        map.insert(&first);
+        map.insert(&second);
+        map.end_trap();
+        map.insert(&after);
+
+        assert_eq!(map.next(Some(&before.id)).map(|h| h.id), Some(first.id));
+        assert_eq!(map.next(Some(&first.id)).map(|h| h.id), Some(second.id));
+        assert_eq!(map.next(Some(&second.id)).map(|h| h.id), Some(first.id));
+        assert_eq!(map.prev(Some(&first.id)).map(|h| h.id), Some(second.id));
+        assert_eq!(map.next(Some(&after.id)).map(|h| h.id), Some(before.id));
+
+        // Replaying the history keeps the trap.
+        let history = map.insertion_history.clone();
+        let mut replayed = TabStopMap::default();
+        replayed.replay(&history);
+        assert_eq!(
+            replayed.next(Some(&second.id)).map(|h| h.id),
+            Some(first.id)
+        );
     }
 
     #[test]

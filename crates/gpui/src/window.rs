@@ -5012,6 +5012,28 @@ impl Window {
         }
     }
 
+    /// Executes the given closure within a tab group and, when `trap` is set,
+    /// a focus trap: Tab and Shift-Tab from a stop inside it stay inside it
+    /// (Astryx patch R12).
+    #[inline]
+    pub fn with_tab_scope<R>(
+        &mut self,
+        index: Option<isize>,
+        trap: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_tab_group(index, |window| {
+            if trap {
+                window.next_frame.tab_stops.begin_trap();
+                let result = f(window);
+                window.next_frame.tab_stops.end_trap();
+                result
+            } else {
+                f(window)
+            }
+        })
+    }
+
     /// Executes the given closure within the context of a tab group.
     #[inline]
     pub fn with_tab_group<R>(&mut self, index: Option<isize>, f: impl FnOnce(&mut Self) -> R) -> R {

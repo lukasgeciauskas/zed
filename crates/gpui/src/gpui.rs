@@ -113,7 +113,9 @@ pub mod private {
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 
-pub use accesskit::{Action as AccessibleAction, AriaCurrent, Orientation, Role, Toggled};
+pub use accesskit::{
+    Action as AccessibleAction, AriaCurrent, HasPopup, Orientation, Role, Toggled,
+};
 pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
