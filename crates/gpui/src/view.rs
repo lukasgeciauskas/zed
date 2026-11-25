@@ -297,6 +297,19 @@ impl<V: View> ViewElement<V> {
         }
     }
 
+    /// The view inside, for a parent that lays some children out its own way,
+    /// such as an inline text flow that folds a styled span into its lines
+    /// (Astryx patch R10).
+    pub fn view_mut(&mut self) -> Option<&mut V> {
+        self.view.as_mut()
+    }
+
+    /// Takes the view out of the element, which must not be laid out after
+    /// (Astryx patch R10).
+    pub fn take_view(&mut self) -> Option<V> {
+        self.view.take()
+    }
+
     /// Enable caching of this view's rendered subtree, laid out at `style`.
     /// The composer supplies the layout style because caching skips rendering
     /// the contents to measure them.
@@ -672,4 +685,27 @@ fn paint_component(
     window.with_id(ElementId::Name(name.into()), |window| {
         element.as_mut().unwrap().paint(window, cx);
     });
+}
+
+#[cfg(test)]
+mod astryx_tests {
+    use super::ViewElement;
+    use crate::{App, IntoElement, RenderOnce, Window, div};
+
+    struct Label(&'static str);
+
+    impl RenderOnce for Label {
+        fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// Astryx patch R10: a parent reaches the view inside, or takes it out.
+    #[test]
+    fn a_parent_reaches_the_view_inside() {
+        let mut element = ViewElement::new(Label("docs"));
+        assert_eq!(element.view_mut().map(|label| label.0), Some("docs"));
+        assert_eq!(element.take_view().map(|label| label.0), Some("docs"));
+        assert!(element.view_mut().is_none());
+    }
 }
