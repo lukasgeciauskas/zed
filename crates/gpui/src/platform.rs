@@ -2647,6 +2647,51 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+    /// Whether misspelled words are marked (the HTML `spellcheck`); `None`
+    /// follows `suggestions` (Astryx patch R11).
+    pub spellcheck: Option<bool>,
+    /// Which software keyboard the field asks for, without changing what it
+    /// accepts (the HTML `inputmode`; Astryx patch R11).
+    pub input_mode: TextInputMode,
+}
+
+/// The software keyboard a text field asks for: the HTML `inputmode` value
+/// set (Astryx patch R11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputMode {
+    /// The platform's text keyboard.
+    #[default]
+    Text,
+    /// No software keyboard: the field brings its own input.
+    None,
+    /// A telephone keypad.
+    Tel,
+    /// A keyboard for URLs.
+    Url,
+    /// A keyboard for email addresses.
+    Email,
+    /// Digits only.
+    Numeric,
+    /// Digits and the locale's decimal separator.
+    Decimal,
+    /// A keyboard for search queries.
+    Search,
+}
+
+impl TextInputMode {
+    /// The HTML `inputmode` value.
+    pub fn as_html(self) -> &'static str {
+        match self {
+            TextInputMode::Text => "text",
+            TextInputMode::None => "none",
+            TextInputMode::Tel => "tel",
+            TextInputMode::Url => "url",
+            TextInputMode::Email => "email",
+            TextInputMode::Numeric => "numeric",
+            TextInputMode::Decimal => "decimal",
+            TextInputMode::Search => "search",
+        }
+    }
 }
 
 /// Automatic capitalization applied by software keyboards.

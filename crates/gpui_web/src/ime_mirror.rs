@@ -17,7 +17,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
+use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration, TextInputMode};
 use wasm_bindgen::JsCast;
 
 use crate::window::WebWindowInner;
@@ -81,6 +81,8 @@ pub(crate) struct ImeMirror {
     /// selection has moved; a rejected import means no import is coming,
     /// so the next sync must reassert the app's state instead of waiting.
     selection_import_rejected: Cell<bool>,
+    /// The keyboard the focused field asks for (Astryx patch R11).
+    input_mode: Cell<TextInputMode>,
 }
 
 impl ImeMirror {
@@ -129,6 +131,7 @@ impl ImeMirror {
             window_hint: Cell::new(0),
             sync_scheduled: Cell::new(false),
             selection_import_rejected: Cell::new(false),
+            input_mode: Cell::new(TextInputMode::Text),
         };
         // Until an input handler asks otherwise, the element is an IME
         // conduit, not a form field: browser-side text assistance would
@@ -143,7 +146,19 @@ impl ImeMirror {
     /// can restart the IME's input connection.
     pub(crate) fn apply_configuration(&self, configuration: &TextInputConfiguration) {
         let element: &web_sys::Element = self.element.as_ref();
-        self.element.set_spellcheck(configuration.suggestions);
+        self.element.set_spellcheck(
+            configuration
+                .spellcheck
+                .unwrap_or(configuration.suggestions),
+        );
+        // Astryx patch R11: the keyboard the field asks for, applied now if
+        // the keyboard is up, else when it comes up.
+        self.input_mode.set(configuration.input_mode);
+        if self.virtual_keyboard_enabled() {
+            element
+                .set_attribute("inputmode", configuration.input_mode.as_html())
+                .ok();
+        }
         let on_off = |enabled: bool| if enabled { "on" } else { "off" };
         element
             .set_attribute("autocomplete", on_off(configuration.suggestions))
@@ -217,10 +232,14 @@ impl ImeMirror {
     }
 
     pub(crate) fn set_virtual_keyboard_enabled(&self, enabled: bool) {
-        if let Err(error) = self
-            .element
-            .set_attribute("inputmode", if enabled { "text" } else { "none" })
-        {
+        if let Err(error) = self.element.set_attribute(
+            "inputmode",
+            if enabled {
+                self.input_mode.get().as_html()
+            } else {
+                "none"
+            },
+        ) {
             log::warn!("Failed to configure input mode: {error:?}");
         }
     }
