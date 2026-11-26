@@ -815,6 +815,14 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Makes this element and everything inside it inert (Astryx patch R20), as HTML's
+    /// `inert`: out of the tab order, never the pointer's target (the pointer reaches what is
+    /// beneath) and out of the accessibility tree.
+    fn inert(mut self, inert: bool) -> Self {
+        self.interactivity().inert = inert;
+        self
+    }
+
     /// Set whether this element is a tab stop.
     ///
     /// When false, the element remains in tab-index order but cannot be reached via keyboard navigation.
@@ -2134,6 +2142,10 @@ impl Element for Div {
         self.interactivity.source_location()
     }
 
+    fn is_inert(&self) -> bool {
+        self.interactivity.inert
+    }
+
     fn a11y_role(&self) -> Option<accesskit::Role> {
         // Nodes with `GenericContainer` should never be reported to accesskit.
         // Equivalent to an HTML div with no role.
@@ -2520,6 +2532,8 @@ pub struct Interactivity {
     pub(crate) window_control: Option<WindowControlArea>,
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) tab_index: Option<isize>,
+    /// Astryx patch R20: this element and its subtree are inert.
+    pub(crate) inert: bool,
     pub(crate) tab_group: bool,
     /// Astryx patch R12: a focus trap.
     pub(crate) tab_trap: bool,
@@ -2772,7 +2786,10 @@ impl Interactivity {
                         window.with_content_mask(
                             style.overflow_mask(bounds, window.rem_size()),
                             |window| {
-                                let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                                // Patch R20: nothing inert is a pointer target.
+                                let hitbox = if window.inert_depth == 0
+                                    && self.should_insert_hitbox(&style, window, cx)
+                                {
                                     Some(window.insert_hitbox(bounds, self.hitbox_behavior))
                                 } else {
                                     None
@@ -2965,7 +2982,9 @@ impl Interactivity {
                                             // sibling groups every container would then sort ahead of
                                             // every item, and `focus_next` from a container would jump
                                             // to the first item in the whole window instead of its own.
-                                            if let Some(focus_handle) = &self.tracked_focus_handle {
+                                            if let Some(focus_handle) = &self.tracked_focus_handle
+                                                && window.inert_depth == 0
+                                            {
                                                 window.next_frame.tab_stops.insert(focus_handle);
                                             }
                                             if let Some(hitbox) = hitbox {
@@ -4812,6 +4831,10 @@ where
         self.element.source_location()
     }
 
+    fn is_inert(&self) -> bool {
+        self.element.is_inert()
+    }
+
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.element.a11y_role()
     }
@@ -6474,6 +6497,83 @@ mod tests {
                     })),
             )
         }
+    }
+
+    /// Astryx patch R20: an inert subtree is out of the tab order and is no pointer target.
+    #[gpui::test]
+    fn inert_subtrees_leave_tab_order_and_pointer(cx: &mut TestAppContext) {
+        use crate::{
+            Context, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+            StatefulInteractiveElement as _, Styled as _, Window, div, point, px,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        struct Page {
+            inert: bool,
+            a: FocusHandle,
+            b: FocusHandle,
+            clicks: Rc<Cell<u32>>,
+        }
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                div()
+                    .size_full()
+                    .child(div().id("a").track_focus(&self.a).tab_index(0).h(px(10.)))
+                    .child(
+                        div().inert(self.inert).child(
+                            div()
+                                .id("b")
+                                .track_focus(&self.b)
+                                .tab_index(0)
+                                .h(px(10.))
+                                .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                        ),
+                    )
+            }
+        }
+
+        let clicks = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let clicks = clicks.clone();
+            move |_, cx| Page {
+                inert: true,
+                a: cx.focus_handle().tab_stop(true),
+                b: cx.focus_handle().tab_stop(true),
+                clicks,
+            }
+        });
+        let cx = &mut crate::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let (a, b) = window
+            .update(cx, |page, _, _| (page.a.clone(), page.b.clone()))
+            .unwrap();
+
+        cx.simulate_click(point(px(5.), px(15.)), crate::Modifiers::none());
+        assert_eq!(clicks.get(), 0, "an inert element is no pointer target");
+        cx.update(|window, cx| window.focus(&a, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus_next(cx));
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|window, _| b.is_focused(window)),
+            "nor a tab stop"
+        );
+
+        window
+            .update(cx, |page, _, cx| {
+                page.inert = false;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_click(point(px(5.), px(15.)), crate::Modifiers::none());
+        assert_eq!(clicks.get(), 1);
+        cx.update(|window, cx| window.focus(&a, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.focus_next(cx));
+        cx.run_until_parked();
+        assert!(cx.update(|window, _| b.is_focused(window)));
     }
 
     #[gpui::test]

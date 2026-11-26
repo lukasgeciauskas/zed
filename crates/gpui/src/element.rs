@@ -114,6 +114,12 @@ pub trait Element: 'static + Sized {
         None
     }
 
+    /// Whether this element and everything inside it is inert (Astryx patch R20): out of the
+    /// tab order, the pointer's targets and the accessibility tree, as HTML's `inert`.
+    fn is_inert(&self) -> bool {
+        false
+    }
+
     /// Write accessibility properties to the given node.
     /// Called only when `a11y_role()` returns `Some`.
     ///
@@ -439,7 +445,12 @@ impl<E: Element> Drawable<E> {
 
                 let bounds = window.layout_bounds(layout_id);
                 let mut pushed_a11y_node = false;
-                if window.a11y.is_active() {
+                // Patch R20: an inert subtree stays out of the accessibility tree.
+                let inert = self.element.is_inert();
+                if inert {
+                    window.inert_depth += 1;
+                }
+                if window.a11y.is_active() && window.inert_depth == 0 {
                     if let Some(global_id) = global_id.as_ref() {
                         if let Some(role) = self.element.a11y_role() {
                             let node_id = global_id.accesskit_node_id();
@@ -486,6 +497,9 @@ impl<E: Element> Drawable<E> {
                     cx,
                 );
                 window.next_frame.dispatch_tree.pop_node();
+                if inert {
+                    window.inert_depth -= 1;
+                }
 
                 if pushed_a11y_node {
                     if let Some(global_id) = global_id.as_ref() {
@@ -551,6 +565,10 @@ impl<E: Element> Drawable<E> {
                 }
 
                 window.next_frame.dispatch_tree.set_active_node(node_id);
+                let inert = self.element.is_inert();
+                if inert {
+                    window.inert_depth += 1;
+                }
                 self.element.paint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
@@ -560,6 +578,9 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
+                if inert {
+                    window.inert_depth -= 1;
+                }
 
                 if global_id.is_some() {
                     window.element_id_stack.pop();
