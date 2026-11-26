@@ -1258,6 +1258,8 @@ pub struct Window {
     pub(crate) sticky_report: bool,
     /// The boxes sticky elements stay within: each parent's, while its children prepaint.
     pub(crate) sticky_containers: Vec<Bounds<Pixels>>,
+    /// Layout glide areas and the one prepainting (Astryx patch R19).
+    pub(crate) layout_glides: crate::elements::LayoutGlides,
     /// Composed element transforms, outermost first (Astryx fork patch R1).
     pub(crate) element_transform_stack: Vec<ElementTransform>,
     pub(crate) element_opacity: f32,
@@ -2457,6 +2459,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             sticky_report: false,
             sticky_containers: Vec::new(),
+            layout_glides: Default::default(),
             element_transform_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,

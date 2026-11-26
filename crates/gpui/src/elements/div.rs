@@ -1962,6 +1962,9 @@ pub fn div() -> Div {
         prepaint_order_fn: None,
         sticky_children: SmallVec::new(),
         sticky_delta: Point::default(),
+        layout_glide: None,
+        glide: Default::default(),
+        site: core::panic::Location::caller(),
     }
 }
 
@@ -2021,11 +2024,25 @@ pub struct Div {
     /// Which children are sticky, from their layout: they prepaint and paint after their
     /// siblings (Astryx patch R18).
     sticky_children: SmallVec<[bool; 8]>,
-    /// How far sticky positioning moved this element this frame.
+    /// How far sticky positioning, and a layout glide (patch R19), moved this element this
+    /// frame.
     sticky_delta: Point<Pixels>,
+    /// The layout glide area this element contains (Astryx patch R19).
+    layout_glide: Option<crate::LayoutGlide>,
+    /// This element's place in its glide area this frame.
+    glide: crate::elements::GlideEntry,
+    /// Where in the source this element was built, which names it in a glide area.
+    site: &'static core::panic::Location<'static>,
 }
 
 impl Div {
+    /// Makes this element a layout glide area (Astryx patch R19): when a change is reported
+    /// through `glide.armed`, the content inside it that the change moves glides there.
+    pub fn layout_glide(mut self, glide: crate::LayoutGlide) -> Self {
+        self.layout_glide = Some(glide);
+        self
+    }
+
     /// Add a listener to be called when the children of this `Div` are prepainted.
     /// This allows you to store the [`Bounds`] of the children for later use.
     pub fn on_children_prepainted(
@@ -2212,6 +2229,20 @@ impl Element for Div {
         } else {
             Point::default()
         };
+        // Patch R19: inside a glide area, a moved element glides to its new place.
+        self.glide = if window.layout_glides.active() {
+            let stuck = self.sticky_delta != Point::default();
+            let absolute = matches!(
+                self.interactivity.base_style.position,
+                Some(crate::Position::Absolute)
+            );
+            window
+                .layout_glides
+                .register(global_id, self.site, bounds, stuck || absolute)
+        } else {
+            Default::default()
+        };
+        self.sticky_delta = self.sticky_delta + self.glide.delta;
         let delta = self.sticky_delta;
         let bounds = Bounds {
             origin: bounds.origin + delta,
@@ -2268,6 +2299,20 @@ impl Element for Div {
                     return hitbox;
                 }
 
+                let glide_area = self.layout_glide.clone();
+                let glide = self.glide;
+                let content_origin = bounds.origin + scroll_offset;
+                if let Some(area) = glide_area.clone() {
+                    let visible = window.content_mask().bounds.intersect(&bounds);
+                    let now = cx.background_executor().now();
+                    window
+                        .layout_glides
+                        .push_area(area, visible, content_origin, now);
+                } else if glide.tracked {
+                    window
+                        .layout_glides
+                        .push_children(glide.key, content_origin);
+                }
                 window.with_image_cache(image_cache, |window| {
                     window.sticky_containers.push(bounds);
                     window.with_element_offset(scroll_offset + delta, |window| {
@@ -2297,6 +2342,13 @@ impl Element for Div {
                         listener(children_bounds, window, cx);
                     }
                 });
+                if glide_area.is_some() {
+                    if window.layout_glides.pop_area() {
+                        window.request_animation_frame();
+                    }
+                } else if glide.tracked {
+                    window.layout_glides.pop_children();
+                }
 
                 hitbox
             },
@@ -2324,37 +2376,40 @@ impl Element for Div {
             size: bounds.size,
         };
         let ordered = self.prepaint_order_fn.is_none();
+        let glide_opacity = self.glide.opacity;
         window.with_image_cache(image_cache, |window| {
-            self.interactivity.paint(
-                global_id,
-                inspector_id,
-                bounds,
-                hitbox.as_ref(),
-                window,
-                cx,
-                |style, window, cx| {
-                    // skip children
-                    if style.display == Display::None {
-                        return;
-                    }
-
-                    if !ordered {
-                        for child in &mut self.children {
-                            child.paint(window, cx);
+            window.with_element_opacity(glide_opacity, |window| {
+                self.interactivity.paint(
+                    global_id,
+                    inspector_id,
+                    bounds,
+                    hitbox.as_ref(),
+                    window,
+                    cx,
+                    |style, window, cx| {
+                        // skip children
+                        if style.display == Display::None {
+                            return;
                         }
-                        return;
-                    }
-                    // Sticky children paint above their siblings (patch R18).
-                    for pass_sticky in [false, true] {
-                        for (ix, child) in self.children.iter_mut().enumerate() {
-                            let sticky = self.sticky_children.get(ix).copied().unwrap_or(false);
-                            if sticky == pass_sticky {
+
+                        if !ordered {
+                            for child in &mut self.children {
                                 child.paint(window, cx);
                             }
+                            return;
                         }
-                    }
-                },
-            )
+                        // Sticky children paint above their siblings (patch R18).
+                        for pass_sticky in [false, true] {
+                            for (ix, child) in self.children.iter_mut().enumerate() {
+                                let sticky = self.sticky_children.get(ix).copied().unwrap_or(false);
+                                if sticky == pass_sticky {
+                                    child.paint(window, cx);
+                                }
+                            }
+                        }
+                    },
+                )
+            })
         });
     }
 }
@@ -4707,6 +4762,14 @@ impl GroupHitboxes {
 /// A wrapper around an element that can store state, produced after assigning an ElementId.
 pub struct Stateful<E> {
     pub(crate) element: E,
+}
+
+impl Stateful<Div> {
+    /// Makes this element a layout glide area (Astryx patch R19); see `Div::layout_glide`.
+    pub fn layout_glide(mut self, glide: crate::LayoutGlide) -> Self {
+        self.element.layout_glide = Some(glide);
+        self
+    }
 }
 
 impl<E> Styled for Stateful<E>
