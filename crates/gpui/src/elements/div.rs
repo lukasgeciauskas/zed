@@ -1960,6 +1960,8 @@ pub fn div() -> Div {
         prepaint_listener: None,
         image_cache: None,
         prepaint_order_fn: None,
+        sticky_children: SmallVec::new(),
+        sticky_delta: Point::default(),
     }
 }
 
@@ -2016,6 +2018,11 @@ pub struct Div {
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
     prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
+    /// Which children are sticky, from their layout: they prepaint and paint after their
+    /// siblings (Astryx patch R18).
+    sticky_children: SmallVec<[bool; 8]>,
+    /// How far sticky positioning moved this element this frame.
+    sticky_delta: Point<Pixels>,
 }
 
 impl Div {
@@ -2141,6 +2148,7 @@ impl Element for Div {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut child_layout_ids = SmallVec::new();
+        let mut sticky_children = SmallVec::new();
         let image_cache = self
             .image_cache
             .as_mut()
@@ -2157,13 +2165,21 @@ impl Element for Div {
                         child_layout_ids = self
                             .children
                             .iter_mut()
-                            .map(|child| child.request_layout(window, cx))
+                            .map(|child| {
+                                // Each sticky child reports itself (patch R18).
+                                window.sticky_report = false;
+                                let id = child.request_layout(window, cx);
+                                sticky_children.push(window.sticky_report);
+                                id
+                            })
                             .collect::<SmallVec<_>>();
                         window.request_layout(style, child_layout_ids.iter().copied(), cx)
                     })
                 },
             )
         });
+        self.sticky_children = sticky_children;
+        window.sticky_report = is_sticky(&self.interactivity.base_style.sticky);
 
         (layout_id, DivFrameState { child_layout_ids })
     }
@@ -2182,6 +2198,25 @@ impl Element for Div {
             .image_cache
             .as_mut()
             .map(|provider| provider.provide(window, cx));
+
+        // Patch R18: a sticky element moves within its scrollport (the content mask), never
+        // leaving its parent's box.
+        let sticky = &self.interactivity.base_style.sticky;
+        self.sticky_delta = if is_sticky(sticky) {
+            sticky_delta(
+                bounds,
+                sticky,
+                window.content_mask().bounds,
+                window.sticky_containers.last().copied(),
+            )
+        } else {
+            Point::default()
+        };
+        let delta = self.sticky_delta;
+        let bounds = Bounds {
+            origin: bounds.origin + delta,
+            size: bounds.size,
+        };
 
         let has_prepaint_listener = self.prepaint_listener.is_some();
         let mut children_bounds = Vec::with_capacity(if has_prepaint_listener {
@@ -2234,7 +2269,8 @@ impl Element for Div {
                 }
 
                 window.with_image_cache(image_cache, |window| {
-                    window.with_element_offset(scroll_offset, |window| {
+                    window.sticky_containers.push(bounds);
+                    window.with_element_offset(scroll_offset + delta, |window| {
                         if let Some(order_fn) = &self.prepaint_order_fn {
                             let order = order_fn(window, cx);
                             for idx in order {
@@ -2243,11 +2279,19 @@ impl Element for Div {
                                 }
                             }
                         } else {
-                            for child in &mut self.children {
-                                child.prepaint(window, cx);
+                            // Sticky children last, so their hitboxes sit on top.
+                            for pass_sticky in [false, true] {
+                                for (ix, child) in self.children.iter_mut().enumerate() {
+                                    let sticky =
+                                        self.sticky_children.get(ix).copied().unwrap_or(false);
+                                    if sticky == pass_sticky {
+                                        child.prepaint(window, cx);
+                                    }
+                                }
                             }
                         }
                     });
+                    window.sticky_containers.pop();
 
                     if let Some(listener) = self.prepaint_listener.as_ref() {
                         listener(children_bounds, window, cx);
@@ -2275,6 +2319,11 @@ impl Element for Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
+        let bounds = Bounds {
+            origin: bounds.origin + self.sticky_delta,
+            size: bounds.size,
+        };
+        let ordered = self.prepaint_order_fn.is_none();
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
@@ -2289,8 +2338,20 @@ impl Element for Div {
                         return;
                     }
 
-                    for child in &mut self.children {
-                        child.paint(window, cx);
+                    if !ordered {
+                        for child in &mut self.children {
+                            child.paint(window, cx);
+                        }
+                        return;
+                    }
+                    // Sticky children paint above their siblings (patch R18).
+                    for pass_sticky in [false, true] {
+                        for (ix, child) in self.children.iter_mut().enumerate() {
+                            let sticky = self.sticky_children.get(ix).copied().unwrap_or(false);
+                            if sticky == pass_sticky {
+                                child.paint(window, cx);
+                            }
+                        }
                     }
                 },
             )
@@ -6369,5 +6430,115 @@ mod tests {
         assert_eq!(bounds("cell-0").origin.x, px(0.));
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
+    }
+}
+
+/// Whether any sticky offset is set (Astryx patch R18).
+fn is_sticky(sticky: &crate::EdgesRefinement<Option<Pixels>>) -> bool {
+    matches!(sticky.top, Some(Some(_)))
+        || matches!(sticky.bottom, Some(Some(_)))
+        || matches!(sticky.left, Some(Some(_)))
+        || matches!(sticky.right, Some(Some(_)))
+}
+
+/// How far a sticky element at `bounds` moves to keep its offsets inside `scrollport`,
+/// as CSS `position: sticky`: a top (left) offset wins over a bottom (right) one, and it
+/// never leaves `container`, its parent's box (Astryx patch R18).
+pub(crate) fn sticky_delta(
+    bounds: Bounds<Pixels>,
+    sticky: &crate::EdgesRefinement<Option<Pixels>>,
+    scrollport: Bounds<Pixels>,
+    container: Option<Bounds<Pixels>>,
+) -> Point<Pixels> {
+    let zero = Pixels::ZERO;
+    let axis = |start: Option<Pixels>,
+                end: Option<Pixels>,
+                lo: Pixels,
+                hi: Pixels,
+                port_lo: Pixels,
+                port_hi: Pixels,
+                box_lo: Option<Pixels>,
+                box_hi: Option<Pixels>| {
+        let mut d = zero;
+        if let Some(offset) = start
+            && lo < port_lo + offset
+        {
+            d = port_lo + offset - lo;
+        } else if let Some(offset) = end
+            && hi > port_hi - offset
+        {
+            d = port_hi - offset - hi;
+        }
+        if d > zero
+            && let Some(box_hi) = box_hi
+        {
+            d = d.min((box_hi - hi).max(zero));
+        } else if d < zero
+            && let Some(box_lo) = box_lo
+        {
+            d = d.max((box_lo - lo).min(zero));
+        }
+        d
+    };
+    let flat = |e: Option<Option<Pixels>>| e.flatten();
+    point(
+        axis(
+            flat(sticky.left),
+            flat(sticky.right),
+            bounds.left(),
+            bounds.right(),
+            scrollport.left(),
+            scrollport.right(),
+            container.map(|c| c.left()),
+            container.map(|c| c.right()),
+        ),
+        axis(
+            flat(sticky.top),
+            flat(sticky.bottom),
+            bounds.top(),
+            bounds.bottom(),
+            scrollport.top(),
+            scrollport.bottom(),
+            container.map(|c| c.top()),
+            container.map(|c| c.bottom()),
+        ),
+    )
+}
+
+#[cfg(test)]
+mod sticky_tests {
+    use super::*;
+    use crate::{EdgesRefinement, px, size};
+
+    fn top(offset: f32) -> EdgesRefinement<Option<Pixels>> {
+        EdgesRefinement {
+            top: Some(Some(px(offset))),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_sticky_top_stays_at_its_offset_within_its_parent() {
+        let port = Bounds::new(point(px(0.), px(100.)), size(px(200.), px(300.)));
+        let parent = Bounds::new(point(px(0.), px(-500.)), size(px(200.), px(1000.)));
+        // Scrolled 40px above the port's top: it moves down to the port's edge.
+        let el = Bounds::new(point(px(0.), px(60.)), size(px(200.), px(50.)));
+        assert_eq!(
+            sticky_delta(el, &top(0.), port, Some(parent)),
+            point(px(0.), px(40.))
+        );
+        // Still below the edge: it stays.
+        let el = Bounds::new(point(px(0.), px(150.)), size(px(200.), px(50.)));
+        assert_eq!(
+            sticky_delta(el, &top(0.), port, Some(parent)),
+            point(px(0.), px(0.))
+        );
+        // Its parent ends: it leaves with it.
+        let parent = Bounds::new(point(px(0.), px(0.)), size(px(200.), px(130.)));
+        let el = Bounds::new(point(px(0.), px(60.)), size(px(200.), px(50.)));
+        assert_eq!(
+            sticky_delta(el, &top(0.), port, Some(parent)),
+            point(px(0.), px(20.))
+        );
     }
 }

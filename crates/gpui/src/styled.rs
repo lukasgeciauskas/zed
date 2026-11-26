@@ -158,6 +158,32 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sticks this element `offset` below its scrollport's top edge while scrolling would carry
+    /// it higher, within its parent, as CSS `position: sticky; top` (Astryx patch R18). It
+    /// draws, and takes the pointer, above its siblings.
+    fn sticky_top(mut self, offset: impl Into<crate::Pixels>) -> Self {
+        self.style().sticky.top = Some(Some(offset.into()));
+        self
+    }
+
+    /// `sticky_top` against the scrollport's bottom edge.
+    fn sticky_bottom(mut self, offset: impl Into<crate::Pixels>) -> Self {
+        self.style().sticky.bottom = Some(Some(offset.into()));
+        self
+    }
+
+    /// `sticky_top` against the scrollport's left edge.
+    fn sticky_left(mut self, offset: impl Into<crate::Pixels>) -> Self {
+        self.style().sticky.left = Some(Some(offset.into()));
+        self
+    }
+
+    /// `sticky_top` against the scrollport's right edge.
+    fn sticky_right(mut self, offset: impl Into<crate::Pixels>) -> Self {
+        self.style().sticky.right = Some(Some(offset.into()));
+        self
+    }
+
     /// A scroll that reaches this element's edge on either axis stays here instead of moving a
     /// scrolling ancestor, as CSS `overscroll-behavior: contain` (Astryx patch R17).
     fn overscroll_contain(mut self) -> Self {

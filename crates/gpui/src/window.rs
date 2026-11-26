@@ -1254,6 +1254,10 @@ pub struct Window {
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+    /// Whether the element whose layout was last requested is sticky (Astryx patch R18).
+    pub(crate) sticky_report: bool,
+    /// The boxes sticky elements stay within: each parent's, while its children prepaint.
+    pub(crate) sticky_containers: Vec<Bounds<Pixels>>,
     /// Composed element transforms, outermost first (Astryx fork patch R1).
     pub(crate) element_transform_stack: Vec<ElementTransform>,
     pub(crate) element_opacity: f32,
@@ -2451,6 +2455,8 @@ impl Window {
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
+            sticky_report: false,
+            sticky_containers: Vec::new(),
             element_transform_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,

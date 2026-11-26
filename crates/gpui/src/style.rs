@@ -201,6 +201,11 @@ pub struct Style {
     /// moving its scrolling ancestor, as CSS `overscroll-behavior: contain` (Astryx patch R17).
     #[refineable]
     pub overscroll_contain: Point<bool>,
+    /// Sticky offsets, as CSS `position: sticky` with `top`, `bottom`, `left` and `right`
+    /// (Astryx patch R18): while its scrollport would carry the element past an offset from
+    /// the scrollport's edge, the element stays there, never leaving its parent.
+    #[refineable]
+    pub sticky: Edges<Option<Pixels>>,
     /// Whether scrolling should be restricted to the input gesture's axis.
     ///
     /// Pixel-based scroll gestures are locked to their initially dominant axis. The lock may be
@@ -834,6 +839,7 @@ impl Default for Style {
             scrollbar_size: ScrollbarSize::Auto,
             scrollbar_color: None,
             overscroll_contain: Point { x: false, y: false },
+            sticky: Edges::default(),
             restrict_scroll_to_axis: false,
             scrollbar_width: AbsoluteLength::default(),
             position: Position::Relative,
