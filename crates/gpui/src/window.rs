@@ -746,6 +746,9 @@ pub struct DismissEvent;
 
 type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 
+/// A raw touch listener (Astryx patch R23); returns whether it claims the touch.
+pub(crate) type AnyTouchListener = Box<dyn FnMut(&TouchEvent, &mut Window, &mut App) -> bool>;
+
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
 
@@ -1055,6 +1058,8 @@ pub(crate) struct Frame {
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    /// Raw touch listeners (Astryx patch R23).
+    pub(crate) touch_listeners: Vec<AnyTouchListener>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -1111,6 +1116,7 @@ impl Frame {
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
             mouse_listeners: Vec::new(),
+            touch_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
@@ -1138,6 +1144,7 @@ impl Frame {
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
+        self.touch_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
@@ -1260,6 +1267,9 @@ pub struct Window {
     pub(crate) sticky_containers: Vec<Bounds<Pixels>>,
     /// Layout glide areas and the one prepainting (Astryx patch R19).
     pub(crate) layout_glides: crate::elements::LayoutGlides,
+    /// Touches a raw touch listener claimed, which GPUI's recognizer no longer sees
+    /// (Astryx patch R23).
+    pub(crate) claimed_touches: FxHashSet<crate::TouchId>,
     /// How many inert elements enclose the one drawing (Astryx patch R20).
     pub(crate) inert_depth: usize,
     /// Composed element transforms, outermost first (Astryx fork patch R1).
@@ -2462,6 +2472,7 @@ impl Window {
             sticky_report: false,
             sticky_containers: Vec::new(),
             layout_glides: Default::default(),
+            claimed_touches: FxHashSet::default(),
             inert_depth: 0,
             element_transform_stack: Vec::new(),
             content_mask_stack: Vec::new(),
@@ -6294,6 +6305,21 @@ impl Window {
         )));
     }
 
+    /// Registers a raw touch listener for the next frame (Astryx patch R23). It sees every
+    /// [`TouchEvent`] of every finger, topmost listener first, before GPUI's touch recognizer
+    /// does. Returning `true` claims that touch: GPUI's recognizer no longer sees it (so it
+    /// makes no taps, scrolls, touch drags or long presses from it), and if it had seen the
+    /// touch start it is told the touch was cancelled. A claim lasts until the touch ends.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn on_touch_event(
+        &mut self,
+        listener: impl FnMut(&TouchEvent, &mut Window, &mut App) -> bool + 'static,
+    ) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.touch_listeners.push(Box::new(listener));
+    }
+
     /// Register a key event listener on this node for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.
@@ -6666,6 +6692,40 @@ impl Window {
         let mut event = event.clone();
         if !self.touch_prediction_enabled {
             event.predicted_position = None;
+        }
+        // Patch R23: raw touch listeners see every touch first, and may claim it.
+        let mut listeners = mem::take(&mut self.rendered_frame.touch_listeners);
+        let was_claimed = self.claimed_touches.contains(&event.id);
+        let mut claims = false;
+        for listener in listeners.iter_mut().rev() {
+            claims |= listener(&event, self, cx);
+        }
+        let added = mem::take(&mut self.rendered_frame.touch_listeners);
+        listeners.extend(added);
+        self.rendered_frame.touch_listeners = listeners;
+        if was_claimed || claims {
+            if !was_claimed && event.phase != crate::TouchPhase::Started {
+                // GPUI's recognizer saw this touch start: it lets it go.
+                let cancel = TouchEvent {
+                    phase: crate::TouchPhase::Cancelled,
+                    ..event.clone()
+                };
+                for gesture in self.touch_gestures.handle_event(&cancel) {
+                    self.dispatch_recognized_touch_gesture(gesture, cx);
+                }
+                if self.touch_gestures.pending_long_press().is_none() {
+                    self.long_press_timer.take();
+                }
+            }
+            if matches!(
+                event.phase,
+                crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
+            ) {
+                self.claimed_touches.remove(&event.id);
+            } else {
+                self.claimed_touches.insert(event.id);
+            }
+            return;
         }
         let recognized_gestures = self.touch_gestures.handle_event(&event);
         if event.phase == crate::TouchPhase::Started
@@ -11145,6 +11205,71 @@ mod tests {
             assert!(!window.has_pending_keystrokes());
             assert_eq!(view.read(cx).action_count, 1);
         });
+    }
+
+    /// Astryx patch R23: raw touch listeners see every finger; a claimed touch never
+    /// reaches GPUI's recognizer, an unclaimed one still taps.
+    struct RawTouches {
+        seen: Rc<RefCell<Vec<(u64, TouchPhase)>>>,
+        clicks: Rc<RefCell<usize>>,
+    }
+
+    impl Render for RawTouches {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.seen.clone();
+            let clicks = self.clicks.clone();
+            div()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, move |_, _, _| *clicks.borrow_mut() += 1)
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            let seen = seen.clone();
+                            window.on_touch_event(move |event, _, _| {
+                                seen.borrow_mut().push((event.id.0, event.phase));
+                                // Claim the second finger only.
+                                event.id == TouchId(2)
+                            });
+                        },
+                    )
+                    .size_full(),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn raw_touch_listeners_see_every_finger_and_claim(cx: &mut TestAppContext) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(RefCell::new(0));
+        let window = cx.add_window({
+            let (seen, clicks) = (seen.clone(), clicks.clone());
+            move |_, _| RawTouches { seen, clicks }
+        });
+        cx.run_until_parked();
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Started, 10.);
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 50.);
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 50.);
+        dispatch_touch(window, cx, TouchId(1), TouchPhase::Ended, 10.);
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [
+                (1, TouchPhase::Started),
+                (2, TouchPhase::Started),
+                (2, TouchPhase::Ended),
+                (1, TouchPhase::Ended),
+            ]
+        );
+        // The claimed finger made nothing; the unclaimed one alone is not a tap either
+        // (two fingers were down), so a single finger checks the tap path.
+        seen.borrow_mut().clear();
+        *clicks.borrow_mut() = 0;
+        dispatch_touch(window, cx, TouchId(3), TouchPhase::Started, 10.);
+        dispatch_touch(window, cx, TouchId(3), TouchPhase::Ended, 10.);
+        assert_eq!(*clicks.borrow(), 1, "an unclaimed touch still taps");
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Started, 10.);
+        dispatch_touch(window, cx, TouchId(2), TouchPhase::Ended, 10.);
+        assert_eq!(*clicks.borrow(), 1, "a claimed touch makes no tap");
     }
 
     fn dispatch_touch<T: 'static>(
