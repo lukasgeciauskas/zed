@@ -192,6 +192,15 @@ pub struct Style {
     pub scrollbar_width: AbsoluteLength,
     /// Whether both x and y axis should be scrollable at the same time.
     pub allow_concurrent_scroll: bool,
+    /// How a scrolling element's scrollbars show, as CSS `scrollbar-width` (Astryx patch R17).
+    pub scrollbar_size: ScrollbarSize,
+    /// The scrollbar's thumb and track colors, as CSS `scrollbar-color`; `None` is the
+    /// platform's look (Astryx patch R17).
+    pub scrollbar_color: Option<ScrollbarColor>,
+    /// Per axis, whether a scroll that reaches this element's edge stays here instead of
+    /// moving its scrolling ancestor, as CSS `overscroll-behavior: contain` (Astryx patch R17).
+    #[refineable]
+    pub overscroll_contain: Point<bool>,
     /// Whether scrolling should be restricted to the input gesture's axis.
     ///
     /// Pixel-based scroll gestures are locked to their initially dominant axis. The lock may be
@@ -822,6 +831,9 @@ impl Default for Style {
                 y: Overflow::Visible,
             },
             allow_concurrent_scroll: false,
+            scrollbar_size: ScrollbarSize::Auto,
+            scrollbar_color: None,
+            overscroll_contain: Point { x: false, y: false },
             restrict_scroll_to_axis: false,
             scrollbar_width: AbsoluteLength::default(),
             position: Position::Relative,
@@ -1306,6 +1318,27 @@ pub enum Overflow {
     /// for a scrollbar. The amount of space reserved is controlled by the `scrollbar_width` property.
     /// Content that overflows this node should *not* contribute to the scroll region of its parent.
     Scroll,
+}
+
+/// How a scrolling element's scrollbars show, as CSS `scrollbar-width` (Astryx patch R17).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub enum ScrollbarSize {
+    /// The platform's scrollbars.
+    #[default]
+    Auto,
+    /// Narrower scrollbars.
+    Thin,
+    /// No scrollbars; the element still scrolls.
+    None,
+}
+
+/// A scrollbar's thumb and track colors, as CSS `scrollbar-color` (Astryx patch R17).
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ScrollbarColor {
+    /// The draggable thumb.
+    pub thumb: Hsla,
+    /// The track behind it.
+    pub track: Hsla,
 }
 
 /// The positioning strategy for this item.

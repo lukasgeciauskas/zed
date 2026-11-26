@@ -7,6 +7,7 @@ mod div;
 mod image_cache;
 mod img;
 mod list;
+mod scrollbars;
 mod surface;
 mod svg;
 mod text;

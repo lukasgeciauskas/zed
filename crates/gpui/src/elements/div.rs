@@ -2357,6 +2357,12 @@ pub struct Interactivity {
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    /// How far the element can scroll, from its last prepaint (Astryx patch R17).
+    pub(crate) scroll_max: Option<Rc<Cell<Point<Pixels>>>>,
+    /// Its scrollbars' state (Astryx patch R17).
+    pub(crate) scrollbar: Option<Rc<RefCell<super::scrollbars::ScrollbarState>>>,
+    /// This frame's scrollbar hitboxes, above the children.
+    pub(crate) scrollbar_hitboxes: Vec<(crate::Axis, Hitbox)>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2510,6 +2516,23 @@ impl Interactivity {
                     );
                 }
 
+                if self.scroll_offset.is_some()
+                    && let Some(element_state) = element_state.as_mut()
+                {
+                    self.scroll_max = Some(
+                        element_state
+                            .scroll_max
+                            .get_or_insert_with(Rc::default)
+                            .clone(),
+                    );
+                    self.scrollbar = Some(
+                        element_state
+                            .scrollbar
+                            .get_or_insert_with(Rc::default)
+                            .clone(),
+                    );
+                }
+
                 let style = self.compute_style_internal(None, element_state.as_mut(), window, cx);
                 let layout_id = f(style, window, cx);
                 (layout_id, element_state)
@@ -2644,6 +2667,13 @@ impl Interactivity {
                                 let result = window.with_element_opacity(style.opacity, |window| {
                                     f(&style, scroll_offset, hitbox, window, cx)
                                 });
+                                self.insert_scrollbar_hitboxes(
+                                    bounds,
+                                    &style,
+                                    scroll_offset,
+                                    window,
+                                    cx,
+                                );
                                 (result, element_state)
                             },
                         )
@@ -2746,6 +2776,9 @@ impl Interactivity {
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
+            }
+            if let Some(max) = self.scroll_max.as_ref() {
+                max.set(scroll_max);
             }
 
             *scroll_offset
@@ -2877,6 +2910,9 @@ impl Interactivity {
                                             }
 
                                             f(&style, window, cx);
+                                            self.paint_scrollbars(
+                                                bounds, hitbox, &style, window, cx,
+                                            );
 
                                             if let Some(_hitbox) = hitbox {
                                                 #[cfg(any(
@@ -3596,6 +3632,215 @@ impl Interactivity {
         }
     }
 
+    /// Astryx patch R17: the hitboxes of this frame's visible scrollbars, above the
+    /// children so a press on a bar never reaches them.
+    fn insert_scrollbar_hitboxes(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        style: &Style,
+        offset: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.scrollbar_hitboxes.clear();
+        let (Some(state), Some(max)) = (self.scrollbar.as_ref(), self.scroll_max.as_ref()) else {
+            return;
+        };
+        let auto_hide = super::scrollbars::auto_hide(cx);
+        let now = cx.background_executor().now();
+        let (alpha, _) = state.borrow().alpha(now, auto_hide);
+        if alpha <= 0. {
+            return;
+        }
+        for bar in super::scrollbars::bars(
+            bounds,
+            max.get(),
+            offset,
+            style.overflow,
+            style.scrollbar_size,
+        ) {
+            let hitbox = window.insert_hitbox(bar.track, HitboxBehavior::BlockMouseExceptScroll);
+            self.scrollbar_hitboxes.push((bar.axis, hitbox));
+        }
+    }
+
+    /// Astryx patch R17: paints the scrollbars over the children and makes them work.
+    fn paint_scrollbars(
+        &self,
+        bounds: Bounds<Pixels>,
+        hitbox: Option<&Hitbox>,
+        style: &Style,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        use super::scrollbars::{PAGE_FRACTION, bars, colors, painted_thumb};
+        use crate::Axis;
+
+        let (Some(state), Some(max), Some(offset)) = (
+            self.scrollbar.clone(),
+            self.scroll_max.clone(),
+            self.scroll_offset.clone(),
+        ) else {
+            return;
+        };
+        if style.scrollbar_size == crate::ScrollbarSize::None {
+            return;
+        }
+        let auto_hide = super::scrollbars::auto_hide(cx);
+        let now = cx.background_executor().now();
+        let (alpha, animating) = state.borrow().alpha(now, auto_hide);
+        if animating {
+            window.request_animation_frame();
+        }
+        let current_view = window.current_view();
+        let overflow = style.overflow;
+        let bar_size = style.scrollbar_size;
+        let bars_now = bars(bounds, max.get(), *offset.borrow(), overflow, bar_size);
+        if bars_now.is_empty() {
+            return;
+        }
+
+        // Pointer movement over the element shows auto-hiding bars.
+        if auto_hide && let Some(hitbox) = hitbox {
+            let (state, hitbox) = (state.clone(), hitbox.clone());
+            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
+                    let now = cx.background_executor().now();
+                    let hidden = state.borrow().alpha(now, true).0 <= 0.;
+                    state.borrow_mut().last_activity = Some(now);
+                    if hidden {
+                        cx.notify(current_view);
+                    }
+                }
+            });
+        }
+
+        if alpha > 0. {
+            let (hovered, dragged) = {
+                let state = state.borrow();
+                (state.hovered, state.drag.map(|(axis, _)| axis))
+            };
+            for bar in &bars_now {
+                let active = hovered == Some(bar.axis) || dragged == Some(bar.axis);
+                let color = colors(style.scrollbar_color, active);
+                if color.track.a > 0. {
+                    window.paint_quad(crate::fill(bar.track, color.track.opacity(alpha)));
+                }
+                let thumb = painted_thumb(bar);
+                let radius = thumb.size.width.min(thumb.size.height) / 2.;
+                window.paint_quad(
+                    crate::fill(thumb, color.thumb.opacity(alpha)).corner_radii(radius),
+                );
+            }
+        }
+
+        let geometry = {
+            let (max, offset) = (max.clone(), offset.clone());
+            move |axis: Axis| {
+                bars(bounds, max.get(), *offset.borrow(), overflow, bar_size)
+                    .into_iter()
+                    .find(|bar| bar.axis == axis)
+            }
+        };
+        let along = |axis: Axis, position: Point<Pixels>| match axis {
+            Axis::Vertical => position.y,
+            Axis::Horizontal => position.x,
+        };
+
+        for (axis, bar_hitbox) in self.scrollbar_hitboxes.iter().cloned() {
+            // Hover marks the bar.
+            {
+                let (state, bar_hitbox) = (state.clone(), bar_hitbox.clone());
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    let over = bar_hitbox.is_hovered(window);
+                    let mut state = state.borrow_mut();
+                    let was = state.hovered == Some(axis);
+                    if over != was {
+                        state.hovered = if over { Some(axis) } else { None };
+                        if !over {
+                            state.last_activity = Some(cx.background_executor().now());
+                        }
+                        cx.notify(current_view);
+                    }
+                });
+            }
+            // A press takes the thumb, or pages toward the press.
+            let (state, offset, max, geometry) =
+                (state.clone(), offset.clone(), max.clone(), geometry.clone());
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || event.button != MouseButton::Left
+                    || !bar_hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                let Some(bar) = geometry(axis) else {
+                    return;
+                };
+                cx.stop_propagation();
+                let at = along(axis, event.position);
+                let thumb_start = bar.thumb_start();
+                let thumb_len = along(axis, bar.thumb.size.into());
+                if at >= thumb_start && at <= thumb_start + thumb_len {
+                    state.borrow_mut().drag = Some((axis, at - thumb_start));
+                } else {
+                    let viewport = along(axis, bounds.size.into());
+                    let page = viewport * PAGE_FRACTION;
+                    let mut offset = offset.borrow_mut();
+                    let max = max.get();
+                    match axis {
+                        Axis::Vertical => {
+                            let step = if at < thumb_start { page } else { -page };
+                            offset.y = (offset.y + step).clamp(-max.y, px(0.));
+                        }
+                        Axis::Horizontal => {
+                            let step = if at < thumb_start { page } else { -page };
+                            offset.x = (offset.x + step).clamp(-max.x, px(0.));
+                        }
+                    }
+                }
+                state.borrow_mut().last_activity = Some(cx.background_executor().now());
+                cx.notify(current_view);
+            });
+        }
+
+        // A dragged thumb follows the pointer anywhere in the window until release.
+        if state.borrow().drag.is_some() {
+            let state_move = state.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Capture {
+                    return;
+                }
+                let Some((axis, grab)) = state_move.borrow().drag else {
+                    return;
+                };
+                let Some(bar) = geometry(axis) else {
+                    return;
+                };
+                let max = max.get();
+                let at = along(axis, event.position) - grab;
+                let mut offset = offset.borrow_mut();
+                match axis {
+                    Axis::Vertical => offset.y = bar.offset_for_thumb_at(at, max.y),
+                    Axis::Horizontal => offset.x = bar.offset_for_thumb_at(at, max.x),
+                }
+                cx.stop_propagation();
+                cx.notify(current_view);
+            });
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                    let mut state = state.borrow_mut();
+                    state.drag = None;
+                    state.last_activity = Some(cx.background_executor().now());
+                    cx.notify(current_view);
+                }
+            });
+        }
+    }
+
     fn paint_scroll_listener(
         &self,
         hitbox: &Hitbox,
@@ -3605,6 +3850,9 @@ impl Interactivity {
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
             let ongoing_scroll = self.ongoing_scroll.clone();
+            let scroll_max = self.scroll_max.clone();
+            let scrollbar = self.scrollbar.clone();
+            let contain = style.overscroll_contain;
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
@@ -3651,10 +3899,35 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
+                    // Astryx patch R17: scroll chaining. The element takes what it can
+                    // move; at its edge the scroll goes on to a scrolling ancestor, unless
+                    // the element contains it on that axis.
+                    let max = scroll_max.as_ref().map(|max| max.get());
+                    let clamp = |value: Pixels, max: Option<Pixels>| match max {
+                        Some(max) => value.clamp(-max, px(0.)),
+                        None => value,
+                    };
+                    scroll_offset.y = clamp(scroll_offset.y + delta_y, max.map(|m| m.y));
+                    scroll_offset.x = clamp(scroll_offset.x + delta_x, max.map(|m| m.x));
                     if *scroll_offset != old_scroll_offset {
+                        if let Some(scrollbar) = scrollbar.as_ref() {
+                            scrollbar.borrow_mut().last_activity =
+                                Some(cx.background_executor().now());
+                        }
+                        cx.stop_propagation();
                         cx.notify(current_view);
+                    } else if let Some(max) = max {
+                        let held_y = contain.y
+                            && overflow.y == Overflow::Scroll
+                            && max.y > px(0.)
+                            && !delta_y.is_zero();
+                        let held_x = contain.x
+                            && overflow.x == Overflow::Scroll
+                            && max.x > px(0.)
+                            && !delta_x.is_zero();
+                        if held_x || held_y {
+                            cx.stop_propagation();
+                        }
                     }
                 }
             });
@@ -3927,6 +4200,8 @@ pub struct InteractiveElementState {
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    scroll_max: Option<Rc<Cell<Point<Pixels>>>>,
+    scrollbar: Option<Rc<RefCell<super::scrollbars::ScrollbarState>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
 }

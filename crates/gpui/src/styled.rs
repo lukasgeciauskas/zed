@@ -136,6 +136,48 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Narrower scrollbars, as CSS `scrollbar-width: thin` (Astryx patch R17).
+    fn scrollbar_thin(mut self) -> Self {
+        self.style().scrollbar_size = Some(crate::ScrollbarSize::Thin);
+        self
+    }
+
+    /// No scrollbars while the element still scrolls, as CSS `scrollbar-width: none`
+    /// (Astryx patch R17).
+    fn scrollbar_none(mut self) -> Self {
+        self.style().scrollbar_size = Some(crate::ScrollbarSize::None);
+        self
+    }
+
+    /// The scrollbar's thumb and track colors, as CSS `scrollbar-color` (Astryx patch R17).
+    fn scrollbar_color(mut self, thumb: impl Into<Hsla>, track: impl Into<Hsla>) -> Self {
+        self.style().scrollbar_color = Some(crate::ScrollbarColor {
+            thumb: thumb.into(),
+            track: track.into(),
+        });
+        self
+    }
+
+    /// A scroll that reaches this element's edge on either axis stays here instead of moving a
+    /// scrolling ancestor, as CSS `overscroll-behavior: contain` (Astryx patch R17).
+    fn overscroll_contain(mut self) -> Self {
+        self.style().overscroll_contain.x = Some(true);
+        self.style().overscroll_contain.y = Some(true);
+        self
+    }
+
+    /// `overscroll_contain` on the horizontal axis only.
+    fn overscroll_x_contain(mut self) -> Self {
+        self.style().overscroll_contain.x = Some(true);
+        self
+    }
+
+    /// `overscroll_contain` on the vertical axis only.
+    fn overscroll_y_contain(mut self) -> Self {
+        self.style().overscroll_contain.y = Some(true);
+        self
+    }
+
     /// Sets the whitespace of the element to `normal`.
     /// [Docs](https://tailwindcss.com/docs/whitespace#normal)
     fn whitespace_normal(mut self) -> Self {

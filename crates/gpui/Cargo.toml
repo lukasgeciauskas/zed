@@ -277,6 +277,10 @@ name = "astryx_native_picker"
 path = "examples/astryx_native_picker.rs"
 
 [[example]]
+name = "astryx_scrolling"
+path = "examples/astryx_scrolling.rs"
+
+[[example]]
 name = "svg"
 path = "examples/svg/svg.rs"
 
