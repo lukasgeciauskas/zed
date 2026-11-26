@@ -75,6 +75,10 @@ pub struct WindowsWindowState {
     pub force_render_pending: Cell<bool>,
 
     pub click_state: ClickState,
+    /// Touches in contact, by Windows pointer id (Astryx patch R21).
+    pub touch_ids: std::cell::RefCell<crate::events::TouchIds>,
+    /// Where the last touch was, for a touch cancelled by a lost capture.
+    pub mouse_position_for_touch: Cell<Point<Pixels>>,
     pub current_cursor: Cell<Option<HCURSOR>>,
     /// Shared with [`WindowsPlatformState::cursor_visible`].
     pub cursor_visible: Arc<AtomicBool>,
@@ -181,6 +185,8 @@ impl WindowsWindowState {
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
             click_state,
+            touch_ids: Default::default(),
+            mouse_position_for_touch: Default::default(),
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),

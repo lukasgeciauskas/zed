@@ -10,7 +10,7 @@ use windows::{
         UI::{
             Controls::*,
             HiDpi::*,
-            Input::{Ime::*, KeyboardAndMouse::*},
+            Input::{Ime::*, KeyboardAndMouse::*, Pointer::*},
             WindowsAndMessaging::*,
         },
     },
@@ -156,6 +156,12 @@ impl WindowsWindowInner {
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
+            WM_POINTERDOWN => self.handle_touch_pointer_msg(handle, wparam, TouchPhase::Started),
+            WM_POINTERUPDATE => self.handle_touch_pointer_msg(handle, wparam, TouchPhase::Moved),
+            WM_POINTERUP => self.handle_touch_pointer_msg(handle, wparam, TouchPhase::Ended),
+            WM_POINTERCAPTURECHANGED => {
+                self.handle_touch_pointer_msg(handle, wparam, TouchPhase::Cancelled)
+            }
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             WM_GPUI_CURSOR_STYLE_CHANGED
             | WM_GPUI_FORCE_UPDATE_WINDOW
@@ -1352,6 +1358,74 @@ impl WindowsWindowInner {
         Some(0)
     }
 
+    /// Astryx patch R21: a finger on a touchscreen arrives as a [`TouchEvent`], as it does
+    /// on the web, rather than as the mouse messages Windows would make up for it. GPUI's
+    /// touch recognizer then turns taps into clicks and pans into scrolls, and elements
+    /// that claim touch drags or long presses get them. Pens, touchpads and mice are left to
+    /// the default handling.
+    fn handle_touch_pointer_msg(
+        &self,
+        handle: HWND,
+        wparam: WPARAM,
+        phase: TouchPhase,
+    ) -> Option<isize> {
+        let pointer_id = wparam.loword() as u32;
+        if phase == TouchPhase::Cancelled {
+            // Capture lost: the touch is over, whatever its type was.
+            let id = self.state.touch_ids.borrow_mut().end(pointer_id)?;
+            let position = self.state.mouse_position_for_touch.get();
+            self.dispatch_touch(id, TouchPhase::Cancelled, position);
+            return None;
+        }
+        let mut kind = POINTER_INPUT_TYPE::default();
+        if unsafe { GetPointerType(pointer_id, &mut kind) }.is_err() || kind != PT_TOUCH {
+            return None;
+        }
+        let mut info = POINTER_INFO::default();
+        unsafe { GetPointerInfo(pointer_id, &mut info) }.ok()?;
+        let mut client = info.ptPixelLocation;
+        unsafe { ScreenToClient(handle, &mut client) }.ok().ok()?;
+        let position = logical_point(
+            client.x as f32,
+            client.y as f32,
+            self.state.scale_factor.get(),
+        );
+        self.state.mouse_position_for_touch.set(position);
+        let canceled = info.pointerFlags.contains(POINTER_FLAG_CANCELED);
+        let mut ids = self.state.touch_ids.borrow_mut();
+        let (id, phase) = match phase {
+            TouchPhase::Started => (ids.start(pointer_id), TouchPhase::Started),
+            TouchPhase::Moved if canceled => (ids.end(pointer_id), TouchPhase::Cancelled),
+            TouchPhase::Moved => {
+                if !info.pointerFlags.contains(POINTER_FLAG_INCONTACT) {
+                    return Some(0);
+                }
+                (ids.active(pointer_id), TouchPhase::Moved)
+            }
+            _ if canceled => (ids.end(pointer_id), TouchPhase::Cancelled),
+            _ => (ids.end(pointer_id), TouchPhase::Ended),
+        };
+        drop(ids);
+        if let Some(id) = id {
+            self.dispatch_touch(id, phase, position);
+        }
+        Some(0)
+    }
+
+    fn dispatch_touch(&self, id: TouchId, phase: TouchPhase, position: Point<Pixels>) {
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return;
+        };
+        func(PlatformInput::Touch(TouchEvent {
+            id,
+            phase,
+            position,
+            predicted_position: None,
+            force: None,
+        }));
+        self.state.callbacks.input.set(Some(func));
+    }
+
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
         None
@@ -1840,5 +1914,30 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+/// Touch identifiers by Windows pointer id; Windows reuses pointer ids, a `TouchId` is
+/// never reused (Astryx patch R21).
+#[derive(Default)]
+pub(crate) struct TouchIds {
+    next: u64,
+    active: std::collections::HashMap<u32, TouchId>,
+}
+
+impl TouchIds {
+    fn start(&mut self, pointer_id: u32) -> Option<TouchId> {
+        let id = TouchId(self.next);
+        self.next = self.next.checked_add(1)?;
+        self.active.insert(pointer_id, id);
+        Some(id)
+    }
+
+    fn active(&self, pointer_id: u32) -> Option<TouchId> {
+        self.active.get(&pointer_id).copied()
+    }
+
+    fn end(&mut self, pointer_id: u32) -> Option<TouchId> {
+        self.active.remove(&pointer_id)
     }
 }
