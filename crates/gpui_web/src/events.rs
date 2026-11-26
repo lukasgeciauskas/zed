@@ -113,6 +113,10 @@ impl TouchIds {
     fn end(&mut self, pointer_id: i32) -> Option<TouchId> {
         self.active.remove(&pointer_id)
     }
+
+    fn any_active(&self) -> bool {
+        !self.active.is_empty()
+    }
 }
 
 impl Default for ClickState {
@@ -297,13 +301,22 @@ impl WebWindowInner {
                 current_state.modifiers = modifiers;
             }
 
-            this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+            let result = this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
                 button,
                 position,
                 modifiers,
                 click_count,
                 first_mouse: false,
             }));
+            // Patch R22: the browser's own context menu opens unless the app took the
+            // right press.
+            if button == MouseButton::Right {
+                this.context_menu_claimed.set(
+                    result
+                        .as_ref()
+                        .is_some_and(|r| !r.propagate || r.default_prevented),
+                );
+            }
 
             this.ime_mirror.focus();
         })
@@ -382,12 +395,17 @@ impl WebWindowInner {
                 current_state.modifiers = modifiers;
             }
 
-            this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+            let result = this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
                 button,
                 position,
                 modifiers,
                 click_count,
             }));
+            if button == MouseButton::Right
+                && result.is_some_and(|r| !r.propagate || r.default_prevented)
+            {
+                this.context_menu_claimed.set(true);
+            }
 
             this.schedule_ime_mirror_sync();
         })
@@ -683,10 +701,23 @@ impl WebWindowInner {
         })
     }
 
+    /// Astryx patch R22: the browser's own context menu (with Inspect) opens on a right
+    /// click, the context menu key or Shift-F10, unless the app took that press or key (a
+    /// handler stopped its propagation or prevented its default, as an app's own context
+    /// menu does). A long press on a touchscreen never opens it: GPUI's long press owns
+    /// the finger.
     fn register_context_menu(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
         self.listen("contextmenu", move |event: JsValue| {
             let event: web_sys::Event = event.unchecked_into();
-            event.prevent_default();
+            let touch = this.touch_ids.borrow().any_active()
+                || js_sys::Reflect::get(&event, &"pointerType".into())
+                    .ok()
+                    .and_then(|kind| kind.as_string())
+                    .is_some_and(|kind| kind == "touch");
+            if touch || this.context_menu_claimed.replace(false) {
+                event.prevent_default();
+            }
         })
     }
 
@@ -797,11 +828,22 @@ impl WebWindowInner {
                 key_char: key_char.clone(),
             };
 
+            // Patch R22: the context menu key and Shift-F10 open the browser's menu unless
+            // the app takes them.
+            let menu_key = keystroke.key == "contextmenu"
+                || (keystroke.key == "f10" && keystroke.modifiers.shift);
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke,
                 is_held,
                 prefer_character_input: false,
             }));
+            if menu_key {
+                this.context_menu_claimed.set(
+                    result
+                        .as_ref()
+                        .is_some_and(|r| !r.propagate || r.default_prevented),
+                );
+            }
 
             if let Some(result) = result {
                 if !result.propagate {

@@ -63,6 +63,8 @@ pub(crate) struct WebWindowInner {
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) touch_ids: RefCell<TouchIds>,
+    /// Whether the app took the last right press or context menu key (Astryx patch R22).
+    pub(crate) context_menu_claimed: Cell<bool>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
     /// Files are being dragged over the canvas (Astryx patch R8).
     pub(crate) file_drag: Cell<bool>,
@@ -218,6 +220,7 @@ impl WebWindow {
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
             touch_ids: RefCell::new(TouchIds::default()),
+            context_menu_claimed: Cell::new(false),
             pressed_button: Cell::new(None),
             file_drag: Cell::new(false),
             last_physical_size: Cell::new((0, 0)),
