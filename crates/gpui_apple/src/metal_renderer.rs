@@ -2,8 +2,9 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    AtlasTextureId, Bounds, ContentMask, DevicePixels, PaintSurface, PaintedPath, PrimitiveBatch,
-    ScaledPixels, Scene, Size, quad_depth, quad_depth_scale, size,
+    AtlasTextureId, Bounds, ContentMask, DevicePixels, LayerComposite, MAX_LAYER_MASK_STOPS,
+    OffscreenLayer, PaintSurface, PaintedPath, PrimitiveBatch, ScaledPixels, Scene, SceneBatch,
+    Size, quad_depth, quad_depth_scale, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -141,6 +142,13 @@ pub struct MetalRenderer {
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     native_views_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// Offscreen layers (Astryx patch R3): composites and the blur's passes.
+    layer_composite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    layer_blur_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// Bound for a layer's painted mask when it has none.
+    layer_mask_placeholder: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// Textures for offscreen layers, kept between frames.
+    layer_pool: LayerTexturePool,
     depth_write_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
     depth_test_state: Retained<ProtocolObject<dyn MTLDepthStencilState>>,
     depth_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
@@ -368,6 +376,39 @@ impl MetalRenderer {
             false,
         )?;
 
+        // Offscreen layers (Astryx patch R3): their textures hold premultiplied
+        // colors, so composites blend them as such.
+        let layer_composite_pipeline_state = build_layer_pipeline_state(
+            &device,
+            &library,
+            "layer_composite",
+            "layer_composite_vertex",
+            "layer_composite_fragment",
+            LayerPass::Composite,
+        )?;
+        let layer_blur_pipeline_state = build_layer_pipeline_state(
+            &device,
+            &library,
+            "layer_blur",
+            "layer_blur_vertex",
+            "layer_blur_fragment",
+            LayerPass::Blur,
+        )?;
+        let layer_mask_placeholder = {
+            let descriptor = MTLTextureDescriptor::new();
+            // SAFETY: A 1 by 1 texture is within every device's limits.
+            unsafe {
+                descriptor.setWidth(1);
+                descriptor.setHeight(1);
+            }
+            descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            descriptor.setUsage(MTLTextureUsage::ShaderRead);
+            descriptor.setStorageMode(MTLStorageMode::Private);
+            device
+                .newTextureWithDescriptor(&descriptor)
+                .context("allocating the layer mask placeholder")?
+        };
+
         let depth_write_state = build_depth_stencil_state(&device, true)?;
         let depth_test_state = build_depth_stencil_state(&device, false)?;
 
@@ -410,6 +451,10 @@ impl MetalRenderer {
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
             native_views_pipeline_state,
+            layer_composite_pipeline_state,
+            layer_blur_pipeline_state,
+            layer_mask_placeholder,
+            layer_pool: LayerTexturePool::default(),
             depth_write_state,
             depth_test_state,
             depth_texture: None,
@@ -581,26 +626,31 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         )?;
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
-            format!(
-                "writing instance data: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
-                scene.paths.len(),
-                scene.shadows.len(),
-                scene.quads.len(),
-                scene.underlines.len(),
-                scene.monochrome_sprites.len(),
-                scene.polychrome_sprites.len(),
-                scene.surfaces.len(),
-            )
-        })?;
+        let command_queue = self.command_queue.clone();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .context("creating command buffer")?;
         let mut surface_textures = Vec::new();
-        let command_buffer = self.draw_primitives_to_texture(
-            scene,
-            &instance_bindings,
-            texture,
-            viewport_size,
-            &mut surface_textures,
-        )?;
+        let mut frame = FrameEncoder {
+            command_buffer: &command_buffer,
+            writer: &mut writer,
+            surface_textures: &mut surface_textures,
+        };
+        self.layer_pool.begin_frame();
+        // Offscreen layers first, each into its own texture, so the scene can
+        // composite them (Astryx patch R3). Metal runs a command buffer's
+        // passes in the order they were encoded.
+        let result = match self.render_layers(scene, &mut frame) {
+            Ok(layers) => {
+                let result =
+                    self.draw_frame_scene(scene, texture, viewport_size, &mut frame, &layers);
+                self.release_layers(layers);
+                result
+            }
+            Err(error) => Err(error),
+        };
+        self.layer_pool.end_frame();
+        result?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let frame_resources = Cell::new(Some((writer.finish(), surface_textures)));
@@ -618,6 +668,320 @@ impl MetalRenderer {
         }
 
         Ok(command_buffer)
+    }
+
+    /// Draws `scene` into the frame's target, compositing its offscreen
+    /// layers from `layers`.
+    fn draw_frame_scene(
+        &mut self,
+        scene: &Scene,
+        texture: &ProtocolObject<dyn MTLTexture>,
+        viewport_size: Size<DevicePixels>,
+        frame: &mut FrameEncoder<'_>,
+        layers: &[Option<RenderedLayer>],
+    ) -> Result<()> {
+        let instance_bindings = write_instances(scene, frame.writer).with_context(|| {
+            format!(
+                "writing instance data: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                scene.paths.len(),
+                scene.shadows.len(),
+                scene.quads.len(),
+                scene.underlines.len(),
+                scene.monochrome_sprites.len(),
+                scene.polychrome_sprites.len(),
+                scene.surfaces.len(),
+            )
+        })?;
+        let depth_texture = self.depth_texture_matching(texture)?;
+        let alpha = if self.opaque { 1. } else { 0. };
+        let target = PassTarget {
+            texture,
+            depth_texture: &depth_texture,
+            size: viewport_size,
+            origin: [0.0, 0.0],
+        };
+        self.encode_scene(
+            scene,
+            &instance_bindings,
+            frame,
+            &target,
+            MTLClearColor {
+                red: 0.,
+                green: 0.,
+                blue: 0.,
+                alpha,
+            },
+            layers,
+        )
+    }
+
+    /// Draws each offscreen layer of `scene` (and the layers inside them)
+    /// into a pooled texture, blurred when its filter says so (Astryx patch
+    /// R3). The result is indexed like `scene.offscreen_layers`.
+    fn render_layers(
+        &mut self,
+        scene: &Scene,
+        frame: &mut FrameEncoder<'_>,
+    ) -> Result<Vec<Option<RenderedLayer>>> {
+        let mut rendered = Vec::with_capacity(scene.offscreen_layers.len());
+        for layer in &scene.offscreen_layers {
+            match self.render_layer(layer, frame) {
+                Ok(layer) => rendered.push(layer),
+                Err(error) => {
+                    self.release_layers(rendered);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(rendered)
+    }
+
+    fn render_layer(
+        &mut self,
+        layer: &OffscreenLayer,
+        frame: &mut FrameEncoder<'_>,
+    ) -> Result<Option<RenderedLayer>> {
+        let width = layer.region.size.width.0;
+        let height = layer.region.size.height.0;
+        if width <= 0
+            || height <= 0
+            || width as u32 > MAX_LAYER_TEXTURE_SIZE
+            || height as u32 > MAX_LAYER_TEXTURE_SIZE
+        {
+            return Ok(None);
+        }
+        let (width, height) = (width as u32, height as u32);
+        let color = self.draw_layer_scene(&layer.content, layer, width, height, frame)?;
+        let mask = match &layer.mask {
+            Some(mask) => match self.draw_layer_scene(mask, layer, width, height, frame) {
+                Ok(mask) => Some(mask),
+                Err(error) => {
+                    self.layer_pool.release(color);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        let rendered = RenderedLayer { color, mask };
+        if layer.filter.blur > 0.0
+            && let Err(error) =
+                self.blur_layer(&rendered.color, layer, width, height, frame.command_buffer)
+        {
+            self.release_layers(vec![Some(rendered)]);
+            return Err(error);
+        }
+        Ok(Some(rendered))
+    }
+
+    /// Draws `scene`, a layer's content or mask, into a pooled texture
+    /// covering the layer's region.
+    fn draw_layer_scene(
+        &mut self,
+        scene: &Scene,
+        layer: &OffscreenLayer,
+        width: u32,
+        height: u32,
+        frame: &mut FrameEncoder<'_>,
+    ) -> Result<LayerTexture> {
+        let children = self.render_layers(scene, frame)?;
+        let texture = match self
+            .layer_pool
+            .acquire(&self.device, width, height, self.is_apple_gpu)
+        {
+            Ok(texture) => texture,
+            Err(error) => {
+                self.release_layers(children);
+                return Err(error);
+            }
+        };
+        let result = match write_instances(scene, frame.writer) {
+            Ok(instance_bindings) => {
+                let target = PassTarget {
+                    texture: &texture.texture,
+                    depth_texture: &texture.depth_texture,
+                    size: size(DevicePixels(width as i32), DevicePixels(height as i32)),
+                    origin: [
+                        layer.region.origin.x.0 as f32,
+                        layer.region.origin.y.0 as f32,
+                    ],
+                };
+                self.encode_scene(
+                    scene,
+                    &instance_bindings,
+                    frame,
+                    &target,
+                    MTLClearColor {
+                        red: 0.,
+                        green: 0.,
+                        blue: 0.,
+                        alpha: 0.,
+                    },
+                    &children,
+                )
+            }
+            Err(error) => Err(error),
+        };
+        self.release_layers(children);
+        match result {
+            Ok(()) => Ok(texture),
+            Err(error) => {
+                self.layer_pool.release(texture);
+                Err(error)
+            }
+        }
+    }
+
+    /// Blurs a layer's texture in place: horizontally into a scratch
+    /// texture, then vertically back.
+    fn blur_layer(
+        &mut self,
+        texture: &LayerTexture,
+        layer: &OffscreenLayer,
+        width: u32,
+        height: u32,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<()> {
+        let scratch = self
+            .layer_pool
+            .acquire(&self.device, width, height, self.is_apple_gpu)?;
+        let uniforms = |source: &LayerTexture, direction: [f32; 2]| LayerUniforms {
+            region: [0.0, 0.0, width as f32, height as f32],
+            texture_size: [source.width as f32, source.height as f32],
+            blur_direction: direction,
+            blur_sigma: layer.filter.blur,
+            ..LayerUniforms::default()
+        };
+        let result = self
+            .blur_pass(
+                command_buffer,
+                texture,
+                &scratch,
+                &uniforms(texture, [1.0, 0.0]),
+            )
+            .and_then(|()| {
+                self.blur_pass(
+                    command_buffer,
+                    &scratch,
+                    texture,
+                    &uniforms(&scratch, [0.0, 1.0]),
+                )
+            });
+        self.layer_pool.release(scratch);
+        result
+    }
+
+    /// One direction of a layer's blur, from `source` into `destination`.
+    fn blur_pass(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        source: &LayerTexture,
+        destination: &LayerTexture,
+        uniforms: &LayerUniforms,
+    ) -> Result<()> {
+        let render_pass_descriptor = MTLRenderPassDescriptor::new();
+        // SAFETY: Index zero is within the render pass's color attachment array.
+        let color_attachment = unsafe {
+            render_pass_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0)
+        };
+        color_attachment.setTexture(Some(&destination.texture));
+        color_attachment.setStoreAction(MTLStoreAction::Store);
+        color_attachment.setLoadAction(MTLLoadAction::Clear);
+        color_attachment.setClearColor(MTLClearColor {
+            red: 0.,
+            green: 0.,
+            blue: 0.,
+            alpha: 0.,
+        });
+        let command_encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+            .context("creating the layer blur's render command encoder")?;
+        command_encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: uniforms.region[2] as f64,
+            height: uniforms.region[3] as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        command_encoder.setRenderPipelineState(&self.layer_blur_pipeline_state);
+        // SAFETY: Metal copies the uniforms, which match the shader's
+        // `LayerUniforms`; the source texture outlives the command buffer's
+        // use of it, since Metal retains encoded resources.
+        unsafe {
+            command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(uniforms).cast(),
+                mem::size_of::<LayerUniforms>(),
+                LayerInputIndex::Uniforms as usize,
+            );
+            command_encoder.setFragmentTexture_atIndex(
+                Some(&source.texture),
+                LayerInputIndex::Texture as usize,
+            );
+            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                MTLPrimitiveType::TriangleStrip,
+                0,
+                4,
+                1,
+                0,
+            );
+        }
+        command_encoder.endEncoding();
+        Ok(())
+    }
+
+    /// Composites a rendered layer where `composite` places it.
+    fn draw_layer_composite(
+        &self,
+        composite: &LayerComposite,
+        layer: &OffscreenLayer,
+        rendered: &RenderedLayer,
+        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    ) {
+        let uniforms =
+            LayerUniforms::for_composite(composite, layer, &rendered.color, rendered.mask.as_ref());
+        let mask = rendered
+            .mask
+            .as_ref()
+            .map_or(&self.layer_mask_placeholder, |mask| &mask.texture);
+        command_encoder.setRenderPipelineState(&self.layer_composite_pipeline_state);
+        // SAFETY: Metal copies the uniforms, which match the shaders'
+        // `LayerUniforms`, and retains the encoded textures.
+        unsafe {
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&uniforms).cast(),
+                mem::size_of_val(&uniforms),
+                LayerInputIndex::Uniforms as usize,
+            );
+            command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(&uniforms).cast(),
+                mem::size_of_val(&uniforms),
+                LayerInputIndex::Uniforms as usize,
+            );
+            command_encoder.setFragmentTexture_atIndex(
+                Some(&rendered.color.texture),
+                LayerInputIndex::Texture as usize,
+            );
+            command_encoder
+                .setFragmentTexture_atIndex(Some(mask), LayerInputIndex::MaskTexture as usize);
+            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                MTLPrimitiveType::TriangleStrip,
+                0,
+                4,
+                1,
+                0,
+            );
+        }
+    }
+
+    fn release_layers(&mut self, layers: Vec<Option<RenderedLayer>>) {
+        for layer in layers.into_iter().flatten() {
+            self.layer_pool.release(layer.color);
+            if let Some(mask) = layer.mask {
+                self.layer_pool.release(mask);
+            }
+        }
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
@@ -756,36 +1120,30 @@ impl MetalRenderer {
         })
     }
 
-    fn draw_primitives_to_texture(
+    /// Draws `scene` into `target` as one render pass of the frame,
+    /// compositing its offscreen layers from `layers` (indexed like
+    /// `scene.offscreen_layers`).
+    fn encode_scene(
         &mut self,
         scene: &Scene,
         instance_bindings: &InstanceBindings,
-        texture: &ProtocolObject<dyn MTLTexture>,
-        viewport_size: Size<DevicePixels>,
-        surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        let command_queue = self.command_queue.clone();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .context("creating command buffer")?;
-        let alpha = if self.opaque { 1. } else { 0. };
-        let depth_texture = self.depth_texture_matching(texture)?;
-
+        frame: &mut FrameEncoder<'_>,
+        target: &PassTarget<'_>,
+        clear_color: MTLClearColor,
+        layers: &[Option<RenderedLayer>],
+    ) -> Result<()> {
+        let viewport_size = target.size;
         let command_encoder = new_command_encoder_for_texture(
-            &command_buffer,
-            texture,
-            &depth_texture,
+            frame.command_buffer,
+            target.texture,
+            target.depth_texture,
             viewport_size,
-            MTLClearColor {
-                red: 0.,
-                green: 0.,
-                blue: 0.,
-                alpha,
-            },
+            clear_color,
         )?;
         let depth_scale = quad_depth_scale(scene.quads.len());
-        // SAFETY: Metal copies both values, which match every vertex shader's
-        // `GlobalInputIndex_ViewportSize` and `GlobalInputIndex_DepthScale` arguments.
+        // SAFETY: Metal copies the values, which match every shader's
+        // `GlobalInputIndex_ViewportSize`, `GlobalInputIndex_DepthScale` and
+        // `GlobalInputIndex_Origin` arguments.
         unsafe {
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&viewport_size).cast(),
@@ -797,6 +1155,16 @@ impl MetalRenderer {
                 mem::size_of_val(&depth_scale),
                 GlobalInputIndex::DepthScale as usize,
             );
+            command_encoder.setVertexBytes_length_atIndex(
+                ptr::NonNull::from(&target.origin).cast(),
+                mem::size_of_val(&target.origin),
+                GlobalInputIndex::Origin as usize,
+            );
+            command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(&target.origin).cast(),
+                mem::size_of_val(&target.origin),
+                GlobalInputIndex::Origin as usize,
+            );
         }
 
         self.draw_opaque_quads(scene.quads.len(), instance_bindings, &command_encoder);
@@ -804,15 +1172,16 @@ impl MetalRenderer {
 
         let mut quad_cursor: u32 = 0;
         let mut path_tile_cursor = 0;
-        for batch in scene.batches() {
+        for batch in scene.batches_with_layers() {
             // Quad shaders assign each quad its own depth.
             // In every other batch type, the depth is fixed to the position of the quad cursor.
-            let (znear, zfar) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
-                (0.0, 1.0)
-            } else {
-                let depth = quad_depth(quad_cursor, depth_scale) as f64;
-                (depth, depth)
-            };
+            let (znear, zfar) =
+                if matches!(&batch, SceneBatch::Primitives(PrimitiveBatch::Quads(_))) {
+                    (0.0, 1.0)
+                } else {
+                    let depth = quad_depth(quad_cursor, depth_scale) as f64;
+                    (depth, depth)
+                };
             command_encoder.setViewport(MTLViewport {
                 originX: 0.0,
                 originY: 0.0,
@@ -821,6 +1190,21 @@ impl MetalRenderer {
                 znear,
                 zfar,
             });
+
+            let batch = match batch {
+                SceneBatch::Primitives(batch) => batch,
+                SceneBatch::Layers(range) => {
+                    for composite in &scene.layer_composites[range] {
+                        let index = composite.layer as usize;
+                        if let (Some(layer), Some(Some(rendered))) =
+                            (scene.offscreen_layers.get(index), layers.get(index))
+                        {
+                            self.draw_layer_composite(composite, layer, rendered, &command_encoder);
+                        }
+                    }
+                    continue;
+                }
+            };
 
             match batch {
                 PrimitiveBatch::Shadows(range) => {
@@ -865,7 +1249,7 @@ impl MetalRenderer {
                         range.start,
                         instance_bindings,
                         &command_encoder,
-                        surface_textures,
+                        frame.surface_textures,
                     ) {
                         command_encoder.endEncoding();
                         return Err(error);
@@ -880,7 +1264,7 @@ impl MetalRenderer {
 
         command_encoder.endEncoding();
 
-        Ok(command_buffer)
+        Ok(())
     }
 
     fn depth_texture_matching(
@@ -1650,44 +2034,59 @@ impl InstanceBufferWriter {
 enum GlobalInputIndex {
     ViewportSize = 0,
     DepthScale = 1,
+    /// Where the render target's top-left pixel is in the window's device
+    /// pixels: zero for the window, a layer's region for an offscreen layer
+    /// (Astryx patch R3). Fragment shaders that read their position bind it
+    /// too.
+    Origin = 2,
 }
 
 #[repr(C)]
 enum ShadowInputIndex {
-    Shadows = 2,
+    Shadows = 3,
 }
 
 #[repr(C)]
 enum QuadInputIndex {
-    Quads = 2,
-    QuadCount = 3,
+    Quads = 3,
+    QuadCount = 4,
 }
 
 #[repr(C)]
 enum UnderlineInputIndex {
-    Underlines = 2,
+    Underlines = 3,
 }
 
 #[repr(C)]
 enum SpriteInputIndex {
-    Sprites = 2,
-    AtlasTextureSize = 3,
-    AtlasTexture = 4,
+    Sprites = 3,
+    AtlasTextureSize = 4,
+    AtlasTexture = 5,
 }
 
 #[repr(C)]
 enum SurfaceInputIndex {
-    Surfaces = 2,
-    TextureSize = 3,
-    YTexture = 4,
-    CbCrTexture = 5,
+    Surfaces = 3,
+    TextureSize = 4,
+    YTexture = 5,
+    CbCrTexture = 6,
 }
 
 #[repr(C)]
 enum PathTileInputIndex {
-    Tiles = 2,
-    Curves = 3,
-    Paints = 4,
+    Tiles = 3,
+    Curves = 4,
+    Paints = 5,
+}
+
+/// The slots of an offscreen layer's composite and blur passes (Astryx patch
+/// R3): its uniforms in the buffer table, its texture and painted mask in the
+/// texture table.
+#[repr(C)]
+enum LayerInputIndex {
+    Uniforms = 3,
+    Texture = 0,
+    MaskTexture = 1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1695,6 +2094,299 @@ enum PathTileInputIndex {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+// --- offscreen layers (Astryx patch R3) ---
+
+/// The largest side of an offscreen layer's texture: Metal's limit on every
+/// Mac GPU family GPUI supports.
+const MAX_LAYER_TEXTURE_SIZE: u32 = 16384;
+
+/// What a frame's passes are encoded into: its command buffer, its instance
+/// data and the surfaces it keeps alive.
+struct FrameEncoder<'a> {
+    command_buffer: &'a ProtocolObject<dyn MTLCommandBuffer>,
+    writer: &'a mut InstanceBufferWriter,
+    surface_textures: &'a mut Vec<CFRetained<CVMetalTexture>>,
+}
+
+/// What a pass draws into: the frame's target or a layer's texture.
+struct PassTarget<'a> {
+    texture: &'a ProtocolObject<dyn MTLTexture>,
+    depth_texture: &'a ProtocolObject<dyn MTLTexture>,
+    /// The viewport, from the target's top-left.
+    size: Size<DevicePixels>,
+    /// Where the target's top-left pixel is in the window's device pixels.
+    origin: [f32; 2],
+}
+
+/// A texture an offscreen layer is drawn into, with its depth buffer.
+struct LayerTexture {
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    depth_texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    width: u32,
+    height: u32,
+    last_used_frame: u64,
+}
+
+/// A layer drawn this frame, ready to composite.
+struct RenderedLayer {
+    color: LayerTexture,
+    mask: Option<LayerTexture>,
+}
+
+/// Layer textures kept between frames, so a layer that animates reuses its
+/// texture instead of creating one every frame. Sizes are rounded up so
+/// layers that grow a little still fit; textures unused for a while are
+/// dropped. A texture handed back while the GPU still reads it is safe to
+/// draw into again: Metal orders the passes that use a tracked resource.
+#[derive(Default)]
+struct LayerTexturePool {
+    free: Vec<LayerTexture>,
+    frame: u64,
+}
+
+/// How many frames an unused layer texture is kept.
+const LAYER_TEXTURE_IDLE_FRAMES: u64 = 120;
+/// Texture sizes are multiples of this.
+const LAYER_TEXTURE_GRANULARITY: u32 = 64;
+
+impl LayerTexturePool {
+    fn begin_frame(&mut self) {
+        self.frame += 1;
+    }
+
+    fn end_frame(&mut self) {
+        let frame = self.frame;
+        self.free
+            .retain(|texture| frame - texture.last_used_frame <= LAYER_TEXTURE_IDLE_FRAMES);
+    }
+
+    /// A texture at least `width` by `height`, from the pool when one fits
+    /// without wasting much of it.
+    fn acquire(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        width: u32,
+        height: u32,
+        is_apple_gpu: bool,
+    ) -> Result<LayerTexture> {
+        let round = |size: u32| {
+            size.next_multiple_of(LAYER_TEXTURE_GRANULARITY)
+                .min(MAX_LAYER_TEXTURE_SIZE)
+                .max(size)
+        };
+        let (rounded_width, rounded_height) = (round(width), round(height));
+        let area = |texture: &LayerTexture| texture.width as u64 * texture.height as u64;
+        // Fits, without more than twice the rounded size on either side.
+        let best = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, texture)| {
+                texture.width >= width
+                    && texture.height >= height
+                    && texture.width <= rounded_width * 2
+                    && texture.height <= rounded_height * 2
+            })
+            .min_by_key(|(_, texture)| area(texture))
+            .map(|(index, _)| index);
+        if let Some(index) = best {
+            return Ok(self.free.swap_remove(index));
+        }
+        let (width, height) = (rounded_width, rounded_height);
+        let descriptor = MTLTextureDescriptor::new();
+        // SAFETY: The size is positive and at most MAX_LAYER_TEXTURE_SIZE,
+        // which every Mac GPU family supports.
+        unsafe {
+            descriptor.setWidth(width as usize);
+            descriptor.setHeight(height as usize);
+        }
+        descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Private);
+        let texture = device
+            .newTextureWithDescriptor(&descriptor)
+            .context("allocating an offscreen layer's texture")?;
+        descriptor.setPixelFormat(MTLPixelFormat::Depth32Float);
+        descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        // The depth buffer never leaves its pass, so Apple GPUs keep it in
+        // tile memory.
+        descriptor.setStorageMode(if is_apple_gpu {
+            MTLStorageMode::Memoryless
+        } else {
+            MTLStorageMode::Private
+        });
+        let depth_texture = device
+            .newTextureWithDescriptor(&descriptor)
+            .context("allocating an offscreen layer's depth texture")?;
+        Ok(LayerTexture {
+            texture,
+            depth_texture,
+            width,
+            height,
+            last_used_frame: 0,
+        })
+    }
+
+    fn release(&mut self, mut texture: LayerTexture) {
+        texture.last_used_frame = self.frame;
+        self.free.push(texture);
+    }
+}
+
+const _: () = assert!(MAX_LAYER_MASK_STOPS * 2 == 16);
+
+/// The `LayerUniforms` of `shaders.metal`: one composite or blur pass's
+/// parameters. Plain arrays, so the generated header lays them out alike.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct LayerUniforms {
+    /// The texture's region in its content's device pixels: origin, then size.
+    pub region: [f32; 4],
+    /// The size of the whole texture, which can be larger than the region.
+    pub texture_size: [f32; 2],
+    pub opacity: f32,
+    pub brightness: f32,
+    /// Maps the region to where it is drawn: the rotation and scale, row by
+    /// row, then the translation.
+    pub matrix: [f32; 4],
+    pub translation: [f32; 2],
+    pub grayscale: f32,
+    pub mask_stop_count: u32,
+    /// The composite's clip in the target's device pixels: origin, then size.
+    pub clip: [f32; 4],
+    /// The gradient mask's parameter, `dot(position, xy) + z`; the last
+    /// value is 1 when a painted mask texture is sampled.
+    pub mask_gradient: [f32; 4],
+    /// The gradient mask's `(parameter, alpha)` stops, in pairs.
+    pub mask_stops: [f32; 16],
+    /// The blur's step, (1, 0) or (0, 1), and its standard deviation.
+    pub blur_direction: [f32; 2],
+    pub blur_sigma: f32,
+    pub _pad: f32,
+    /// The painted mask's texture size; it covers the same region.
+    pub mask_texture_size: [f32; 2],
+}
+
+impl Default for LayerUniforms {
+    fn default() -> Self {
+        Self {
+            region: [0.0; 4],
+            texture_size: [1.0; 2],
+            opacity: 1.0,
+            brightness: 1.0,
+            matrix: [1.0, 0.0, 0.0, 1.0],
+            translation: [0.0; 2],
+            grayscale: 0.0,
+            mask_stop_count: 0,
+            clip: [0.0; 4],
+            mask_gradient: [0.0; 4],
+            mask_stops: [0.0; 16],
+            blur_direction: [0.0; 2],
+            blur_sigma: 0.0,
+            _pad: 0.0,
+            mask_texture_size: [1.0; 2],
+        }
+    }
+}
+
+impl LayerUniforms {
+    fn for_composite(
+        composite: &LayerComposite,
+        layer: &OffscreenLayer,
+        texture: &LayerTexture,
+        mask: Option<&LayerTexture>,
+    ) -> Self {
+        let filter = &layer.filter;
+        let [[a, b], [c, d]] = composite.transformation.rotation_scale;
+        let mut mask_stops = [0.0; 16];
+        for (index, stop) in filter.mask_stops.iter().enumerate() {
+            mask_stops[index * 2] = stop[0];
+            mask_stops[index * 2 + 1] = stop[1];
+        }
+        let clip = composite.content_mask.bounds;
+        Self {
+            region: [
+                composite.bounds.origin.x.0,
+                composite.bounds.origin.y.0,
+                composite.bounds.size.width.0,
+                composite.bounds.size.height.0,
+            ],
+            texture_size: [texture.width as f32, texture.height as f32],
+            opacity: filter.opacity,
+            brightness: filter.brightness,
+            matrix: [a, b, c, d],
+            translation: composite.transformation.translation,
+            grayscale: filter.grayscale,
+            mask_stop_count: filter.mask_stop_count,
+            clip: [
+                clip.origin.x.0,
+                clip.origin.y.0,
+                clip.size.width.0,
+                clip.size.height.0,
+            ],
+            mask_gradient: [
+                filter.mask_gradient[0],
+                filter.mask_gradient[1],
+                filter.mask_gradient[2],
+                if mask.is_some() { 1.0 } else { 0.0 },
+            ],
+            mask_stops,
+            mask_texture_size: mask
+                .map_or([1.0; 2], |mask| [mask.width as f32, mask.height as f32]),
+            ..Self::default()
+        }
+    }
+}
+
+/// Which of a layer's passes a pipeline draws.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerPass {
+    /// Into a scene's pass: premultiplied blending, depth tested like the
+    /// primitives around it.
+    Composite,
+    /// Into a scratch texture with no depth buffer, replacing its pixels.
+    Blur,
+}
+
+fn build_layer_pipeline_state(
+    device: &ProtocolObject<dyn MTLDevice>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pass: LayerPass,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+    let vertex_fn = library
+        .newFunctionWithName(&NSString::from_str(vertex_fn_name))
+        .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
+    let fragment_fn = library
+        .newFunctionWithName(&NSString::from_str(fragment_fn_name))
+        .with_context(|| format!("locating fragment function {fragment_fn_name}"))?;
+
+    let descriptor = MTLRenderPipelineDescriptor::new();
+    descriptor.setLabel(Some(&NSString::from_str(label)));
+    descriptor.setVertexFunction(Some(vertex_fn.as_ref()));
+    descriptor.setFragmentFunction(Some(fragment_fn.as_ref()));
+    // SAFETY: Index zero is within the pipeline's color attachment array.
+    let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+    color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    let composite = pass == LayerPass::Composite;
+    color_attachment.setBlendingEnabled(composite);
+    color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
+    color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
+    color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::One);
+    color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+    color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    if composite {
+        descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
+    }
+
+    device
+        .newRenderPipelineStateWithDescriptor_error(&descriptor)
+        .with_context(|| format!("creating {label} render pipeline"))
 }
 
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -1899,5 +2591,251 @@ mod tests {
         command_buffer.waitUntilCompleted();
         assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(read_texture_to_image(&target_texture).unwrap(), image);
+    }
+}
+
+/// Offscreen layers (Astryx patch R3) drawn by the headless Metal renderer and
+/// read back: the same cases as the DirectX and wgpu renderers' tests.
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+    use gpui::{
+        BorderStyle, Corners, Edges, Hsla, LayerFilter, LayerParams, PlatformHeadlessRenderer,
+        Point, Quad, Radians, TransformationMatrix,
+    };
+
+    const SIZE: i32 = 32;
+
+    fn device_size() -> Size<DevicePixels> {
+        size(DevicePixels(SIZE), DevicePixels(SIZE))
+    }
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
+        let bounds = bounds(x, y, width, height);
+        Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: color.into(),
+            border_color: color,
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    fn params(filter: LayerFilter) -> LayerParams {
+        let window = bounds(0., 0., SIZE as f32, SIZE as f32);
+        let mut params = LayerParams::new(ContentMask { bounds: window }, window);
+        params.filter = filter;
+        params
+    }
+
+    fn render(scene: &mut Scene) -> image::RgbaImage {
+        scene.finish();
+        let mut renderer = MetalHeadlessRenderer::new().expect("a Metal device");
+        renderer
+            .render_scene_to_image(scene, device_size())
+            .expect("the scene renders")
+    }
+
+    #[track_caller]
+    fn assert_pixel(image: &image::RgbaImage, x: u32, y: u32, expected: [u8; 4]) {
+        let actual = image.get_pixel(x, y).0;
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 4),
+            "pixel ({x}, {y}) was {actual:?}, expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn a_layer_fades_as_one_group() {
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter {
+            opacity: 0.5,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(4., 4., 16., 16., gpui::red()));
+        // Drawn over the red one: in the group only blue shows there.
+        scene.insert_primitive(quad(12., 4., 16., 16., gpui::blue()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 8, 8, [128, 0, 0, 255]);
+        assert_pixel(&image, 16, 8, [0, 0, 128, 255]);
+        assert_pixel(&image, 24, 8, [0, 0, 128, 255]);
+        assert_pixel(&image, 2, 2, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_layer_rotates_its_content() {
+        let mut scene = Scene::default();
+        // A bar from (14, 4) to (18, 28), turned a quarter around the center.
+        let rotation = TransformationMatrix::unit()
+            .translate(Point::new(ScaledPixels(16.), ScaledPixels(16.)))
+            .rotate(Radians(std::f32::consts::FRAC_PI_2))
+            .translate(Point::new(ScaledPixels(-16.), ScaledPixels(-16.)));
+        let mut rotated = params(LayerFilter::default());
+        rotated.transformation = rotation;
+        scene.push_offscreen(rotated);
+        scene.insert_primitive(quad(14., 4., 4., 24., gpui::red()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 6, 16, [255, 0, 0, 255]);
+        assert_pixel(&image, 26, 16, [255, 0, 0, 255]);
+        assert_pixel(&image, 16, 6, [0, 0, 0, 255]);
+        assert_pixel(&image, 16, 26, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn filters_change_the_layers_colors() {
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter {
+            grayscale: 1.0,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(0., 0., 16., 32., gpui::red()));
+        scene.pop_offscreen();
+        scene.push_offscreen(params(LayerFilter {
+            brightness: 0.5,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(16., 0., 16., 32., gpui::blue()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        // CSS grayscale weighs red by 0.2126.
+        assert_pixel(&image, 8, 16, [54, 54, 54, 255]);
+        assert_pixel(&image, 24, 16, [0, 0, 128, 255]);
+    }
+
+    #[test]
+    fn a_gradient_mask_fades_the_layer() {
+        let mut filter = LayerFilter::default();
+        // Alpha from 0 at x = 0 to 1 at x = 32.
+        filter.mask_gradient = [1. / 32., 0., 0.];
+        filter.mask_stops[0] = [0., 0.];
+        filter.mask_stops[1] = [1., 1.];
+        filter.mask_stop_count = 2;
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(filter));
+        scene.insert_primitive(quad(0., 0., 32., 32., gpui::white()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        let at = |x: u32| image.get_pixel(x, 16).0[0] as f32 / 255.;
+        // Fragments are sampled at pixel centers.
+        assert!((at(8) - 8.5 / 32.).abs() < 0.03, "{}", at(8));
+        assert!((at(24) - 24.5 / 32.).abs() < 0.03, "{}", at(24));
+    }
+
+    #[test]
+    fn a_painted_mask_hides_what_it_leaves_out() {
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter::default()));
+        scene.insert_primitive(quad(0., 0., 32., 32., gpui::red()));
+        scene.push_offscreen_mask();
+        scene.insert_primitive(quad(0., 0., 16., 32., gpui::black()));
+        scene.pop_offscreen_mask();
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 8, 16, [255, 0, 0, 255]);
+        assert_pixel(&image, 24, 16, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_blur_spreads_the_layer() {
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter {
+            blur: 2.0,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(12., 12., 8., 8., gpui::white()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        let red = |x: u32, y: u32| image.get_pixel(x, y).0[0];
+        // Light reaches past the edge, and the center loses some.
+        assert!(red(10, 16) > 20, "{}", red(10, 16));
+        assert!(red(16, 16) < 250 && red(16, 16) > 150, "{}", red(16, 16));
+        assert!(red(2, 2) < 3, "{}", red(2, 2));
+        // Symmetric left and right.
+        assert!(red(10, 16).abs_diff(red(21, 16)) <= 4);
+    }
+
+    #[test]
+    fn nested_layers_multiply() {
+        let mut scene = Scene::default();
+        let half = LayerFilter {
+            opacity: 0.5,
+            ..LayerFilter::default()
+        };
+        scene.push_offscreen(params(half));
+        scene.push_offscreen(params(half));
+        scene.insert_primitive(quad(0., 0., 32., 32., gpui::white()));
+        scene.pop_offscreen();
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 16, 16, [64, 64, 64, 255]);
+    }
+
+    #[test]
+    fn layers_are_drawn_in_paint_order() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 0., 32., 32., gpui::red()));
+        scene.push_offscreen(params(LayerFilter::default()));
+        scene.insert_primitive(quad(0., 0., 16., 32., gpui::blue()));
+        scene.pop_offscreen();
+        scene.insert_primitive(quad(8., 0., 4., 32., gpui::green()));
+        let image = render(&mut scene);
+        assert_pixel(&image, 4, 16, [0, 0, 255, 255]);
+        assert_pixel(&image, 10, 16, [0, 128, 0, 255]);
+        assert_pixel(&image, 24, 16, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_layer_draws_where_its_region_sits() {
+        // A layer away from the window's corner: its texture's origin is the
+        // region's, which every shader subtracts.
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter {
+            opacity: 0.5,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(20., 20., 8., 8., gpui::white()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 24, 24, [128, 128, 128, 255]);
+        assert_pixel(&image, 18, 24, [0, 0, 0, 255]);
+        assert_pixel(&image, 24, 18, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn layer_textures_are_reused_across_frames() {
+        let mut renderer = MetalHeadlessRenderer::new().expect("a Metal device");
+        for _ in 0..3 {
+            let mut scene = Scene::default();
+            scene.push_offscreen(params(LayerFilter {
+                blur: 1.0,
+                ..LayerFilter::default()
+            }));
+            scene.insert_primitive(quad(4., 4., 8., 8., gpui::white()));
+            scene.pop_offscreen();
+            scene.finish();
+            renderer
+                .render_scene_to_image(&scene, device_size())
+                .expect("the scene renders");
+        }
+        // The layer's texture and the blur's scratch one.
+        assert_eq!(renderer.renderer.layer_pool.free.len(), 2);
     }
 }

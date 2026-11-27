@@ -64,6 +64,9 @@ mod apple_build {
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
             "TransformationMatrix".into(),
+            // Offscreen layers (Astryx patch R3).
+            "LayerInputIndex".into(),
+            "LayerUniforms".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;

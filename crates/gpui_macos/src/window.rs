@@ -1972,6 +1972,14 @@ impl PlatformWindow for MacWindow {
         false
     }
 
+    /// Offscreen layers are drawn by the Metal renderer (Astryx patch R3).
+    /// `GPUI_DISABLE_OFFSCREEN_LAYERS` turns them off, to see the fallback
+    /// renderers without them use.
+    fn supports_offscreen_layers(&self) -> bool {
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        !*DISABLED.get_or_init(|| std::env::var_os("GPUI_DISABLE_OFFSCREEN_LAYERS").is_some())
+    }
+
     fn set_edited(&mut self, edited: bool) {
         unsafe {
             let window = self.0.lock().native_window;
