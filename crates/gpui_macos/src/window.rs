@@ -1770,6 +1770,24 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().input_handler.take()
     }
 
+    fn native_picker_supported(&self, _kind: gpui::NativePickerKind) -> bool {
+        true
+    }
+
+    // Astryx patch R16: an NSDatePicker in a popover below the field.
+    fn show_native_picker(
+        &self,
+        request: gpui::NativePickerRequest,
+    ) -> Option<oneshot::Receiver<gpui::NativePickerOutcome>> {
+        let lock = self.0.lock();
+        crate::native_picker::show(
+            lock.native_view.as_ptr(),
+            lock.closed.clone(),
+            &lock.foreground_executor,
+            request,
+        )
+    }
+
     fn prompt(
         &self,
         level: PromptLevel,

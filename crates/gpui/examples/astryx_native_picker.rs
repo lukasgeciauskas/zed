@@ -2,8 +2,12 @@
 //! the platform's own date, time or date-and-time picker below an anchor and
 //! answers through a channel: a picked ISO value, a clear, or a dismissal.
 //! Windows shows the Common Controls month calendar or date-time picker in a
-//! popup; the browser shows its `<input type=date|time|datetime-local>` picker.
-//! Elsewhere `native_picker_supported` is false and nothing opens.
+//! popup; macOS an `NSDatePicker` in a popover; the browser its
+//! `<input type=date|time|datetime-local>` picker. Elsewhere
+//! `native_picker_supported` is false and nothing opens.
+//!
+//! `ASTRYX_NATIVE_PICKER_OPEN=date` (or `time`, `datetime`) opens that picker
+//! once the window has drawn, for screenshots.
 
 #![cfg_attr(target_family = "wasm", no_main)]
 
@@ -19,6 +23,8 @@ use gpui_platform::application;
 struct Pickers {
     anchors: [Bounds<Pixels>; 3],
     last: SharedString,
+    /// The picker `ASTRYX_NATIVE_PICKER_OPEN` names, until it opens.
+    open_at_start: Option<usize>,
 }
 
 const KINDS: [(NativePickerKind, &str, &str); 3] = [
@@ -61,6 +67,15 @@ impl Pickers {
 
 impl Render for Pickers {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(index) = self.open_at_start {
+            // The anchors are known once a frame has painted them.
+            if self.anchors[index] == Bounds::default() {
+                window.request_animation_frame();
+            } else {
+                self.open_at_start = None;
+                cx.defer_in(window, move |this, window, cx| this.open(index, window, cx));
+            }
+        }
         let supported = window.native_picker_supported(NativePickerKind::Date);
         div()
             .size_full()
@@ -121,6 +136,14 @@ fn run_example() {
                 cx.new(|_| Pickers {
                     anchors: [Bounds::default(); 3],
                     last: "No picker has answered yet.".into(),
+                    open_at_start: std::env::var("ASTRYX_NATIVE_PICKER_OPEN").ok().and_then(
+                        |kind| match kind.as_str() {
+                            "date" => Some(0),
+                            "time" => Some(1),
+                            "datetime" => Some(2),
+                            _ => None,
+                        },
+                    ),
                 })
             },
         )
