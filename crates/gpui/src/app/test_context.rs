@@ -705,6 +705,12 @@ impl TestAppContext {
         .unwrap();
     }
 
+    /// Simulates the platform reporting new insets for a window: the regions obscured by
+    /// system UI and the keyboard (Astryx patch R24).
+    pub fn simulate_window_insets_change(&self, window: AnyWindowHandle, insets: crate::WindowInsets) {
+        self.test_window(window).simulate_insets_change(insets);
+    }
+
     /// Returns the `TestWindow` backing the given handle.
     pub(crate) fn test_window(&self, window: AnyWindowHandle) -> TestWindow {
         test_window(&self.app, window)
@@ -1050,6 +1056,11 @@ impl VisualTestContext {
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_resize(&self, size: Size<Pixels>) {
         self.simulate_window_resize(self.window, size)
+    }
+
+    /// Simulates the platform reporting new insets for this window (Astryx patch R24).
+    pub fn simulate_insets_change(&self, insets: crate::WindowInsets) {
+        self.cx.simulate_window_insets_change(self.window, insets)
     }
 
     /// Simulates a change in whether the platform is presenting this window.
