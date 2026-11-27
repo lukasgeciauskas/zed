@@ -532,6 +532,14 @@ impl PlatformWindow for TestWindow {
         false
     }
 
+    fn supports_offscreen_layers(&self) -> bool {
+        self.0
+            .lock()
+            .platform
+            .upgrade()
+            .is_some_and(|platform| platform.offscreen_layers_supported())
+    }
+
     fn set_title(&mut self, title: &str) {
         self.0.lock().title = Some(title.to_owned());
     }

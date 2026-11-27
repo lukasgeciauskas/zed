@@ -340,6 +340,11 @@ struct ViewElementCacheKey {
     text_style: TextStyle,
     opacity: f32,
     transform: crate::ElementTransform,
+    /// The offscreen layers around the view (Astryx patch R3): whether there
+    /// are any, which changes how text is drawn, and the rotated or scaled
+    /// ones, which its hitboxes map through.
+    in_offscreen_layer: bool,
+    layer_hit_steps: Option<std::rc::Rc<[crate::LayerHitStep]>>,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -553,6 +558,8 @@ fn prepaint_view(
                 let text_style = window.text_style();
                 let opacity = window.element_opacity();
                 let transform = window.element_transform();
+                let in_offscreen_layer = window.in_offscreen_layer();
+                let layer_hit_steps = window.layer_hit_steps.clone();
 
                 // Opacity is compared by bits so that a NaN opacity still matches itself
                 // and the view keeps using its cache.
@@ -562,6 +569,8 @@ fn prepaint_view(
                     && element_state.cache_key.text_style == text_style
                     && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
                     && element_state.cache_key.transform == transform
+                    && element_state.cache_key.in_offscreen_layer == in_offscreen_layer
+                    && element_state.cache_key.layer_hit_steps == layer_hit_steps
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -599,6 +608,8 @@ fn prepaint_view(
                             text_style,
                             opacity,
                             transform,
+                            in_offscreen_layer,
+                            layer_hit_steps,
                         },
                     },
                 )

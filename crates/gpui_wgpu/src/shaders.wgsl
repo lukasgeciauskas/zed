@@ -85,6 +85,11 @@ struct GlobalParams {
     quad_count: u32,
     premultiplied_alpha: u32,
     pad: u32,
+    // Where the render target's top-left pixel is in the window's device
+    // pixels: zero for the window, a layer's region for an offscreen layer
+    // (Astryx patch R3).
+    origin: vec2<f32>,
+    pad2: vec2<u32>,
 }
 
 struct GammaParams {
@@ -174,8 +179,14 @@ struct TransformationMatrix {
 }
 
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
-    let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    let device_position = (position - globals.origin) / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     return vec4<f32>(device_position, 0.0, 1.0);
+}
+
+// A fragment's position in the window's device pixels, the space primitives
+// are in, whichever target is drawn.
+fn frag_position(position: vec4<f32>) -> vec2<f32> {
+    return position.xy + globals.origin;
 }
 
 fn to_device_position(unit_vertex: vec2<f32>, bounds: Bounds) -> vec4<f32> {
@@ -603,12 +614,12 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     let quad = load_quad(input.quad_id);
     let prepared = PreparedBackground(input.background_color0, input.background_color1,
         input.background_tag);
-    let background = background_color(prepared, quad.background, quad.bounds, input.position.xy);
+    let background = background_color(prepared, quad.background, quad.bounds, frag_position(input.position));
     let unrounded = !has_rounded_corners(quad.corner_radii);
 
     let size = quad.bounds.size;
     let half_size = size / 2.0;
-    let point = input.position.xy - quad.bounds.origin;
+    let point = frag_position(input.position) - quad.bounds.origin;
     let center_to_point = point - half_size;
 
     // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -1111,20 +1122,20 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
-        let distance = quad_sdf(input.position.xy, shadow.shape_bounds, shadow.shape_corner_radii);
+        let distance = quad_sdf(frag_position(input.position), shadow.shape_bounds, shadow.shape_corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
         let center = shadow.shape_bounds.origin + shadow.shape_bounds.size / 2.0;
         let blur = PreparedBlurredRoundedRect(input.blur_shape, input.blur_r1,
                                               input.blur_exponent, input.blur_scale);
-        alpha = blurred_rounded_rect(input.position.xy - center, blur);
+        alpha = blurred_rounded_rect(frag_position(input.position) - center, blur);
     }
 
     if (shadow.inset != 0u) {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        let element_distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        let element_distance = quad_sdf(frag_position(input.position), shadow.bounds, shadow.corner_radii);
         alpha *= saturate(0.5 - element_distance);
     }
 
@@ -1261,7 +1272,7 @@ fn correct_for_endpoint(endpoint: vec2<f32>, step: f32, reference: vec2<f32>, ce
 
 @fragment
 fn fs_path_tile(input: PathTileVarying) -> @location(0) vec4<f32> {
-    let center = floor(input.position.xy) + 0.5;
+    let center = floor(frag_position(input.position)) + 0.5;
     if (input.background_tag == 0u
         && (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
         return blend_color(input.background_color0, 1.0);
@@ -1300,7 +1311,7 @@ fn fs_path_tile(input: PathTileVarying) -> @location(0) vec4<f32> {
 
     let prepared = PreparedBackground(input.background_color0, input.background_color1,
         input.background_tag);
-    let color = background_color(prepared, paint.color, paint.bounds, input.position.xy);
+    let color = background_color(prepared, paint.color, paint.bounds, frag_position(input.position));
     return blend_color(color, coverage);
 }
 
@@ -1348,7 +1359,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let underline = load_underline(input.underline_id);
     let half_thickness = underline.thickness * 0.5;
 
-    let st = (input.position.xy - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
+    let st = (frag_position(input.position) - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
     let frequency = M_PI_F * WAVE_FREQUENCY * underline.thickness / underline.bounds.size.y;
     let amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.y;
 
@@ -1456,7 +1467,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     if (sprite.grayscale != 0u) {
         color = vec4<f32>(vec3<f32>(dot(color.rgb, GRAYSCALE_FACTORS)), color.a);
     }
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let distance = quad_sdf(frag_position(input.position), sprite.bounds, sprite.corner_radii);
     return blend_color(color, input.opacity * saturate(0.5 - distance));
 }
 
@@ -1504,4 +1515,154 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         1.0);
 
     return ycbcr_to_RGB * y_cb_cr;
+}
+
+// --- offscreen layers (Astryx patch R3) --- //
+
+struct LayerParams {
+    // The texture's region in its content's device pixels: origin, size.
+    region: vec4<f32>,
+    // The size of the whole texture, which can be larger than the region.
+    texture_size: vec2<f32>,
+    opacity: f32,
+    brightness: f32,
+    // Maps the region to where it is drawn: rotation_scale (row-major), then
+    // the translation.
+    matrix: vec4<f32>,
+    translation: vec2<f32>,
+    grayscale: f32,
+    mask_stop_count: u32,
+    // The composite's clip in the target's device pixels: origin, size.
+    clip: vec4<f32>,
+    // The gradient mask's parameter: dot(position, xy) + z. w: whether a
+    // painted mask texture is sampled.
+    mask_gradient: vec4<f32>,
+    // The gradient mask's (parameter, alpha) stops, two in each.
+    mask_stops: array<vec4<f32>, 4>,
+    // The blur's step, (1, 0) or (0, 1), and its standard deviation.
+    blur_direction: vec2<f32>,
+    blur_sigma: f32,
+    pad: f32,
+    // The painted mask's texture size; it covers the same region.
+    mask_texture_size: vec2<f32>,
+    pad2: vec2<f32>,
+}
+
+@group(1) @binding(0) var<uniform> layer_params: LayerParams;
+@group(1) @binding(1) var t_layer: texture_2d<f32>;
+@group(1) @binding(2) var t_layer_mask: texture_2d<f32>;
+@group(1) @binding(3) var s_layer: sampler;
+
+fn layer_mask_stop(index: u32) -> vec2<f32> {
+    let pair = layer_params.mask_stops[index / 2u];
+    return select(pair.zw, pair.xy, index % 2u == 0u);
+}
+
+fn layer_mask_alpha(position: vec2<f32>) -> f32 {
+    let count = layer_params.mask_stop_count;
+    if (count == 0u) {
+        return 1.0;
+    }
+    let t = dot(position, layer_params.mask_gradient.xy) + layer_params.mask_gradient.z;
+    var previous = layer_mask_stop(0u);
+    if (t <= previous.x) {
+        return previous.y;
+    }
+    for (var i = 1u; i < count; i++) {
+        let stop = layer_mask_stop(i);
+        if (t <= stop.x) {
+            let span = stop.x - previous.x;
+            if (span <= 1.0e-6) {
+                return stop.y;
+            }
+            return mix(previous.y, stop.y, (t - previous.x) / span);
+        }
+        previous = stop;
+    }
+    return previous.y;
+}
+
+struct LayerCompositeVarying {
+    @builtin(position) position: vec4<f32>,
+    // The fragment in the layer's content's device pixels.
+    @location(0) layer_position: vec2<f32>,
+}
+
+@vertex
+fn vs_layer_composite(@builtin(vertex_index) vertex_id: u32) -> LayerCompositeVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let position = layer_params.region.xy + unit_vertex * layer_params.region.zw;
+    let transformed = vec2<f32>(
+        dot(layer_params.matrix.xy, position),
+        dot(layer_params.matrix.zw, position),
+    ) + layer_params.translation;
+
+    var out = LayerCompositeVarying();
+    out.position = to_device_position_impl(transformed);
+    out.layer_position = position;
+    return out;
+}
+
+@fragment
+fn fs_layer_composite(input: LayerCompositeVarying) -> @location(0) vec4<f32> {
+    let target_position = frag_position(input.position);
+    let uv = (input.layer_position - layer_params.region.xy) / layer_params.texture_size;
+    let mask_uv = (input.layer_position - layer_params.region.xy) / layer_params.mask_texture_size;
+    // Sampled before any branch, as WGSL's uniformity rules require.
+    var color = textureSampleLevel(t_layer, s_layer, uv, 0.0);
+    let painted_mask = textureSampleLevel(t_layer_mask, s_layer, mask_uv, 0.0).a;
+    if (any(target_position < layer_params.clip.xy) || any(target_position >= layer_params.clip.xy + layer_params.clip.zw)) {
+        return vec4<f32>(0.0);
+    }
+    // Premultiplied, as primitives blend into a transparent target.
+    color = vec4<f32>(min(color.rgb * layer_params.brightness, vec3<f32>(color.a)), color.a);
+    let gray = dot(color.rgb, GRAYSCALE_FACTORS);
+    color = vec4<f32>(mix(color.rgb, vec3<f32>(gray), layer_params.grayscale), color.a);
+    var alpha = layer_params.opacity * layer_mask_alpha(input.layer_position);
+    if (layer_params.mask_gradient.w > 0.5) {
+        alpha *= painted_mask;
+    }
+    return color * alpha;
+}
+
+struct LayerBlurVarying {
+    @builtin(position) position: vec4<f32>,
+}
+
+// Covers the whole viewport, which is the layer's region.
+@vertex
+fn vs_layer_blur(@builtin(vertex_index) vertex_id: u32) -> LayerBlurVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var out = LayerBlurVarying();
+    out.position = vec4<f32>(unit_vertex * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    return out;
+}
+
+// The source at a position in its region's pixels; transparent outside it.
+fn layer_blur_sample(position: vec2<f32>) -> vec4<f32> {
+    let color = textureSampleLevel(t_layer, s_layer, position / layer_params.texture_size, 0.0);
+    let inside = all(position >= vec2<f32>(0.0)) && all(position <= layer_params.region.zw);
+    return select(vec4<f32>(0.0), color, inside);
+}
+
+// One direction of a separable Gaussian blur. Each pair of neighboring taps
+// is read with one bilinear sample between them.
+@fragment
+fn fs_layer_blur(input: LayerBlurVarying) -> @location(0) vec4<f32> {
+    let center = input.position.xy;
+    let sigma = max(layer_params.blur_sigma, 0.001);
+    let radius = min(i32(ceil(sigma * 3.0)), 192);
+    let denominator = 2.0 * sigma * sigma;
+    var sum = layer_blur_sample(center);
+    var total = 1.0;
+    for (var i = 1; i <= radius; i += 2) {
+        let w1 = exp(-f32(i * i) / denominator);
+        let w2 = exp(-f32((i + 1) * (i + 1)) / denominator);
+        let weight = w1 + w2;
+        let offset = (f32(i) * w1 + f32(i + 1) * w2) / weight;
+        let delta = layer_params.blur_direction * offset;
+        sum += (layer_blur_sample(center + delta) + layer_blur_sample(center - delta)) * weight;
+        total += 2.0 * weight;
+    }
+    return sum / total;
 }

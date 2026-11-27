@@ -45,6 +45,8 @@ pub(crate) struct TestPlatform {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) native_pickers: RefCell<TestNativePickers>,
     screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
+    /// Whether test windows draw offscreen layers (Astryx patch R3).
+    offscreen_layers: Cell<bool>,
     pub opened_url: RefCell<Option<String>>,
     pub(crate) system_notifications: RefCell<TestSystemNotifications>,
     pub text_system: Arc<dyn PlatformTextSystem>,
@@ -260,6 +262,7 @@ impl TestPlatform {
             #[cfg(any(test, feature = "test-support"))]
             native_pickers: Default::default(),
             screen_capture_sources: Default::default(),
+            offscreen_layers: Cell::new(true),
             active_cursor: Default::default(),
             displays: RefCell::new(vec![TestDisplay::new()]),
             displays_changed_callback: Default::default(),
@@ -384,6 +387,16 @@ impl TestPlatform {
             .take()
             .expect("no native picker is open");
         tx.send(outcome).ok();
+    }
+
+    /// Whether test windows draw offscreen layers (Astryx patch R3). On by
+    /// default, so scenes hold layers as on DirectX and wgpu.
+    pub(crate) fn set_offscreen_layers_supported(&self, supported: bool) {
+        self.offscreen_layers.set(supported);
+    }
+
+    pub(crate) fn offscreen_layers_supported(&self) -> bool {
+        self.offscreen_layers.get()
     }
 
     pub(crate) fn has_pending_prompt(&self) -> bool {

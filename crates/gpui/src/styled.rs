@@ -922,6 +922,66 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Rotates this element and its children clockwise when painted, around
+    /// the transform origin, like CSS `rotate`. Layout is unaffected. The
+    /// subtree is drawn to an offscreen layer and composited rotated, with
+    /// the element's `scale` and `translate`, and hit testing follows (Astryx
+    /// patch R3). Renderers without offscreen layers paint it unrotated.
+    fn rotate(mut self, angle: impl Into<crate::Radians>) -> Self {
+        self.style().rotate = Some(angle.into().0);
+        self
+    }
+
+    /// Rotates this element by `degrees` clockwise; see [`Self::rotate`].
+    fn rotate_degrees(mut self, degrees: f32) -> Self {
+        self.style().rotate = Some(degrees.to_radians());
+        self
+    }
+
+    /// Fades this element and its children as one group, like CSS
+    /// `opacity`: overlapping children don't show through each other. The
+    /// subtree is drawn to an offscreen layer (Astryx patch R3). `opacity`
+    /// fades each primitive instead, which needs no layer.
+    fn layer_opacity(mut self, opacity: f32) -> Self {
+        self.style().layer_opacity = Some(opacity);
+        self
+    }
+
+    /// Blurs this element and its children with a Gaussian of standard
+    /// deviation `radius`, like CSS `filter: blur()` (Astryx patch R3).
+    fn filter_blur(mut self, radius: impl Into<crate::Pixels>) -> Self {
+        self.style().filter_blur = Some(radius.into());
+        self
+    }
+
+    /// Multiplies the colors of this element and its children, like CSS
+    /// `filter: brightness()` (Astryx patch R3).
+    fn filter_brightness(mut self, brightness: f32) -> Self {
+        self.style().filter_brightness = Some(brightness);
+        self
+    }
+
+    /// Desaturates this element and its children by `amount`, from 0 to 1,
+    /// like CSS `filter: grayscale()` (Astryx patch R3).
+    fn filter_grayscale(mut self, amount: f32) -> Self {
+        self.style().filter_grayscale = Some(amount);
+        self
+    }
+
+    /// Masks this element and its children's alpha with a linear gradient,
+    /// like CSS `mask-image: linear-gradient(...)` (Astryx patch R3).
+    fn mask_linear(mut self, mask: crate::LinearMask) -> Self {
+        self.style().mask = Some(crate::LayerMask::Linear(mask));
+        self
+    }
+
+    /// Masks this element and its children's alpha, like CSS `mask-image`
+    /// (Astryx patch R3).
+    fn mask(mut self, mask: impl Into<crate::LayerMask>) -> Self {
+        self.style().mask = Some(mask.into());
+        self
+    }
+
     /// Lays this element's children out as children of its parent, with no box of its
     /// own: CSS `display: contents` (Astryx patch R7).
     fn display_contents(mut self) -> Self {

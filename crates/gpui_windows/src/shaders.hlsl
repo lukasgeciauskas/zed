@@ -7,7 +7,10 @@ cbuffer GlobalParams: register(b0) {
     float subpixel_enhanced_contrast;
     uint is_bgr;
     float depth_scale;
-    uint2 global_pad;
+    // Where the render target's top-left pixel is in the window's device
+    // pixels: zero for the window, a layer's region for an offscreen layer
+    // (Astryx patch R3).
+    float2 global_origin;
 };
 
 cbuffer BatchParams: register(b1) {
@@ -102,8 +105,14 @@ static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
 static const uint SIMPLE_PRIMITIVE_FLAG = 1u << 31;
 
 float4 to_device_position_impl(float2 position) {
-    float2 device_position = position / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    float2 device_position = (position - global_origin) / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
     return float4(device_position, 0., 1.);
+}
+
+// A fragment's position in the window's device pixels, the space primitives
+// are in, whichever target is drawn.
+float2 frag_position(float4 position) {
+    return position.xy + global_origin;
 }
 
 float4 to_device_position(float2 unit_vertex, Bounds bounds) {
@@ -280,8 +289,7 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds bounds,
                                       TransformationMatrix transformation) {
     float2 position = unit_vertex * bounds.size + bounds.origin;
     float2 transformed = mul(position, transformation.rotation_scale) + transformation.translation;
-    float2 device_position = transformed / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
-    return float4(device_position, 0.0, 1.0);
+    return to_device_position_impl(transformed);
 }
 
 // Implementation of quad signed distance field
@@ -563,12 +571,12 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     Quad quad = quads[input.quad_id];
     float4 background =
-        background_color(input.background, quad.background, quad.bounds, input.position.xy);
+        background_color(input.background, quad.background, quad.bounds, frag_position(input.position));
     bool unrounded = !has_rounded_corners(quad.corner_radii);
 
     float2 size = quad.bounds.size;
     float2 half_size = size / 2.;
-    float2 the_point = input.position.xy - quad.bounds.origin;
+    float2 the_point = frag_position(input.position) - quad.bounds.origin;
     float2 center_to_point = the_point - half_size;
 
     // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -986,18 +994,18 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
 
     float alpha;
     if (shadow.blur_radius == 0.) {
-        float distance = quad_sdf(input.position.xy, shadow.shape_bounds, shadow.shape_corner_radii);
+        float distance = quad_sdf(frag_position(input.position), shadow.shape_bounds, shadow.shape_corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
         float2 center = shadow.shape_bounds.origin + shadow.shape_bounds.size / 2.;
-        alpha = blurred_rounded_rect(input.position.xy - center, input.blur);
+        alpha = blurred_rounded_rect(frag_position(input.position) - center, input.blur);
     }
 
     if (shadow.inset != 0u) {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        float element_distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        float element_distance = quad_sdf(frag_position(input.position), shadow.bounds, shadow.corner_radii);
         alpha *= saturate(0.5 - element_distance);
     }
 
@@ -1140,7 +1148,7 @@ void correct_for_endpoint(float2 endpoint, float step, float2 reference, float2 
 }
 
 float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
-    float2 center = floor(input.position.xy) + 0.5;
+    float2 center = floor(frag_position(input.position)) + 0.5;
     if (input.background.tag == 0u
         && (any(center < input.curve_box.xy) || any(center > input.curve_box.zw))) {
         return input.background.color0;
@@ -1177,7 +1185,7 @@ float4 path_tile_fragment(PathTileFragmentInput input): SV_Target {
     }
 
     float4 color =
-        background_color(input.background, paint.color, paint.bounds, input.position.xy);
+        background_color(input.background, paint.color, paint.bounds, frag_position(input.position));
     return float4(color.rgb, color.a * coverage);
 }
 
@@ -1232,7 +1240,7 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
     float half_thickness = underline.thickness * 0.5;
     float2 origin = underline.bounds.origin;
 
-    float2 st = ((input.position.xy - origin) / underline.bounds.size.y) - float2(0., 0.5);
+    float2 st = ((frag_position(input.position) - origin) / underline.bounds.size.y) - float2(0., 0.5);
     float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.y;
     float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.y;
 
@@ -1366,7 +1374,156 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     if (sprite.grayscale != 0u) {
         color.rgb = dot(color.rgb, GRAYSCALE_FACTORS);
     }
-    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    float distance = quad_sdf(frag_position(input.position), sprite.bounds, sprite.corner_radii);
     color.a *= input.opacity * saturate(0.5 - distance);
     return color;
+}
+
+/*
+**
+**              Offscreen layers (Astryx patch R3)
+**
+*/
+
+cbuffer LayerParams: register(b2) {
+    // The texture's region in its content's device pixels: origin, size.
+    float4 layer_region;
+    // The size of the whole texture, which can be larger than the region.
+    float2 layer_texture_size;
+    float layer_opacity;
+    float layer_brightness;
+    // Maps the region to where it is drawn: rotation_scale (row-major), then
+    // the translation.
+    float4 layer_matrix;
+    float2 layer_translation;
+    float layer_grayscale;
+    uint layer_mask_stop_count;
+    // The composite's clip in the target's device pixels: origin, size.
+    float4 layer_clip;
+    // The gradient mask's parameter: dot(position, xy) + z. w: whether a
+    // painted mask texture is sampled.
+    float4 layer_mask_gradient;
+    // The gradient mask's (parameter, alpha) stops, two in each.
+    float4 layer_mask_stops[4];
+    // The blur's step, (1, 0) or (0, 1), and its standard deviation.
+    float2 layer_blur_direction;
+    float layer_blur_sigma;
+    float layer_pad;
+    // The painted mask's texture size; it covers the same region.
+    float2 layer_mask_texture_size;
+    float2 layer_pad2;
+};
+
+Texture2D<float4> t_layer: register(t0);
+Texture2D<float4> t_layer_mask: register(t5);
+SamplerState s_layer: register(s1);
+
+float2 layer_mask_stop(uint index) {
+    float4 pair = layer_mask_stops[index / 2];
+    return (index % 2 == 0) ? pair.xy : pair.zw;
+}
+
+float layer_mask_alpha(float2 position) {
+    uint count = layer_mask_stop_count;
+    if (count == 0) {
+        return 1.0;
+    }
+    float t = dot(position, layer_mask_gradient.xy) + layer_mask_gradient.z;
+    float2 previous = layer_mask_stop(0);
+    if (t <= previous.x) {
+        return previous.y;
+    }
+    [loop]
+    for (uint i = 1; i < count; i++) {
+        float2 stop = layer_mask_stop(i);
+        if (t <= stop.x) {
+            float span = stop.x - previous.x;
+            if (span <= 1.0e-6) {
+                return stop.y;
+            }
+            return lerp(previous.y, stop.y, (t - previous.x) / span);
+        }
+        previous = stop;
+    }
+    return previous.y;
+}
+
+struct LayerCompositeFragmentInput {
+    float4 position: SV_Position;
+    // The fragment in the layer's content's device pixels.
+    float2 layer_position: POSITION;
+};
+
+LayerCompositeFragmentInput layer_composite_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    float2 position = layer_region.xy + unit_vertex * layer_region.zw;
+    float2 transformed = float2(
+        dot(layer_matrix.xy, position),
+        dot(layer_matrix.zw, position)) + layer_translation;
+
+    LayerCompositeFragmentInput output;
+    output.position = to_device_position_impl(transformed);
+    output.layer_position = position;
+    return output;
+}
+
+float4 layer_composite_fragment(LayerCompositeFragmentInput input): SV_Target {
+    float2 target = frag_position(input.position);
+    if (any(target < layer_clip.xy) || any(target >= layer_clip.xy + layer_clip.zw)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    float2 uv = (input.layer_position - layer_region.xy) / layer_texture_size;
+    // Premultiplied, as primitives blend into a transparent target.
+    float4 color = t_layer.Sample(s_layer, uv);
+    color.rgb = min(color.rgb * layer_brightness, color.aaa);
+    float gray = dot(color.rgb, GRAYSCALE_FACTORS);
+    color.rgb = lerp(color.rgb, float3(gray, gray, gray), layer_grayscale);
+    float alpha = layer_opacity * layer_mask_alpha(input.layer_position);
+    if (layer_mask_gradient.w > 0.5) {
+        float2 mask_uv = (input.layer_position - layer_region.xy) / layer_mask_texture_size;
+        alpha *= t_layer_mask.Sample(s_layer, mask_uv).a;
+    }
+    return color * alpha;
+}
+
+struct LayerBlurFragmentInput {
+    float4 position: SV_Position;
+};
+
+// Covers the whole viewport, which is the layer's region.
+LayerBlurFragmentInput layer_blur_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    LayerBlurFragmentInput output;
+    output.position = float4(unit_vertex * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return output;
+}
+
+// The source at a position in its region's pixels; transparent outside it.
+float4 layer_blur_sample(float2 position) {
+    if (any(position < float2(0.0, 0.0)) || any(position > layer_region.zw)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    return t_layer.SampleLevel(s_layer, position / layer_texture_size, 0.0);
+}
+
+// One direction of a separable Gaussian blur. Each pair of neighboring taps
+// is read with one bilinear sample between them.
+float4 layer_blur_fragment(LayerBlurFragmentInput input): SV_Target {
+    float2 center = input.position.xy;
+    float sigma = max(layer_blur_sigma, 0.001);
+    int radius = min(int(ceil(sigma * 3.0)), 192);
+    float denominator = 2.0 * sigma * sigma;
+    float4 sum = layer_blur_sample(center);
+    float total = 1.0;
+    [loop]
+    for (int i = 1; i <= radius; i += 2) {
+        float w1 = exp(-float(i * i) / denominator);
+        float w2 = exp(-float((i + 1) * (i + 1)) / denominator);
+        float weight = w1 + w2;
+        float offset = (float(i) * w1 + float(i + 1) * w2) / weight;
+        float2 step = layer_blur_direction * offset;
+        sum += (layer_blur_sample(center + step) + layer_blur_sample(center - step)) * weight;
+        total += 2.0 * weight;
+    }
+    return sum / total;
 }

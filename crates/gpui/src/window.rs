@@ -250,6 +250,10 @@ impl WindowInvalidator {
         self.inner.borrow_mut().draw_phase = phase
     }
 
+    pub(crate) fn phase(&self) -> DrawPhase {
+        self.inner.borrow().draw_phase
+    }
+
     pub fn update_count(&self) -> usize {
         self.inner.borrow().update_count
     }
@@ -1063,6 +1067,9 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    /// The rotated or scaled offscreen layers each hitbox is in, outermost
+    /// first, for hitboxes in any (Astryx patch R3).
+    pub(crate) hitbox_layer_steps: FxHashMap<HitboxId, Rc<[crate::LayerHitStep]>>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1120,6 +1127,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            hitbox_layer_steps: FxHashMap::default(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1151,6 +1159,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.hitbox_layer_steps.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1188,6 +1197,19 @@ impl Frame {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
+            // Inside rotated or scaled layers, the position is mapped into
+            // the space the hitbox was inserted in.
+            let position = if self.hitbox_layer_steps.is_empty() {
+                position
+            } else {
+                match self.hitbox_layer_steps.get(&hitbox.id) {
+                    Some(steps) => match crate::map_through_layers(steps, position) {
+                        Some(position) => position,
+                        None => continue,
+                    },
+                    None => position,
+                }
+            };
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
@@ -1274,6 +1296,14 @@ pub struct Window {
     pub(crate) inert_depth: usize,
     /// Composed element transforms, outermost first (Astryx fork patch R1).
     pub(crate) element_transform_stack: Vec<ElementTransform>,
+    /// Whether the renderer draws offscreen layers (Astryx patch R3).
+    pub(crate) offscreen_layers_supported: bool,
+    /// How many offscreen layers enclose what is drawn.
+    pub(crate) offscreen_depth: usize,
+    /// The rotated or scaled layers enclosing what is drawn, outermost first.
+    pub(crate) layer_hit_steps: Option<Rc<[crate::LayerHitStep]>>,
+    /// Layers kept for snapshots.
+    pub(crate) layer_snapshots: crate::LayerSnapshots,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -2475,6 +2505,10 @@ impl Window {
             claimed_touches: FxHashSet::default(),
             inert_depth: 0,
             element_transform_stack: Vec::new(),
+            offscreen_layers_supported: false,
+            offscreen_depth: 0,
+            layer_hit_steps: None,
+            layer_snapshots: Default::default(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -3913,6 +3947,13 @@ impl Window {
         if self.platform_window.prepare_frame() {
             self.refresh();
         }
+        let offscreen_layers_supported = self.platform_window.supports_offscreen_layers();
+        if offscreen_layers_supported != self.offscreen_layers_supported {
+            // Cached views painted for the other path are painted again.
+            self.offscreen_layers_supported = offscreen_layers_supported;
+            self.layer_snapshots.clear();
+            self.refresh();
+        }
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -3988,6 +4029,8 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        self.layer_snapshots
+            .update(&self.next_frame.scene, self.scale_factor());
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -4493,11 +4536,20 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .cloned(),
-        );
+        let reused_hitboxes =
+            &self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index];
+        if !self.rendered_frame.hitbox_layer_steps.is_empty() {
+            for hitbox in reused_hitboxes {
+                if let Some(steps) = self.rendered_frame.hitbox_layer_steps.get(&hitbox.id) {
+                    self.next_frame
+                        .hitbox_layer_steps
+                        .insert(hitbox.id, steps.clone());
+                }
+            }
+        }
+        self.next_frame
+            .hitboxes
+            .extend(reused_hitboxes.iter().cloned());
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
@@ -5601,6 +5653,12 @@ impl Window {
             return false;
         }
 
+        // A layer's texture starts transparent, which subpixel text can't
+        // be blended onto (Astryx patch R3).
+        if self.in_offscreen_layer() {
+            return false;
+        }
+
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
@@ -6143,6 +6201,9 @@ impl Window {
             content_mask,
             behavior,
         };
+        if let Some(steps) = &self.layer_hit_steps {
+            self.next_frame.hitbox_layer_steps.insert(id, steps.clone());
+        }
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
     }

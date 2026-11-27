@@ -48,6 +48,11 @@ pub(crate) struct DirectXRenderer {
     width: u32,
     height: u32,
 
+    /// Textures for offscreen layers, kept between frames (Astryx patch R3).
+    layer_pool: LayerTexturePool,
+    /// The viewport of the pass being drawn: the window's, or a layer's.
+    pass_viewport: D3D11_VIEWPORT,
+
     /// Whether we want to skip drwaing due to device lost events.
     ///
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
@@ -90,12 +95,17 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    layer_composite: LayerPipeline,
+    layer_blur: LayerPipeline,
 }
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    /// Offscreen layers' parameters and their clamping sampler (Astryx patch R3).
+    layer_params_buffer: Option<ID3D11Buffer>,
+    layer_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -193,6 +203,8 @@ impl DirectXRenderer {
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
+            layer_pool: LayerTexturePool::default(),
+            pass_viewport: D3D11_VIEWPORT::default(),
             skip_draws: false,
         })
     }
@@ -201,8 +213,14 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    fn pre_draw(&self, clear_color: &[f32; 4], depth_scale: f32) -> Result<()> {
-        let resources = self.resources.as_ref().expect("resources missing");
+    /// Starts a pass into `target`: clears it, binds it with its depth
+    /// buffer, and sets the global parameters for its viewport and origin.
+    fn pre_draw(
+        &mut self,
+        target: &PassTarget,
+        clear_color: &[f32; 4],
+        depth_scale: f32,
+    ) -> Result<()> {
         let device_context = &self
             .devices
             .as_ref()
@@ -213,24 +231,25 @@ impl DirectXRenderer {
             self.globals.global_params_buffer.as_ref().unwrap(),
             &[GlobalParams {
                 gamma_ratios: self.font_info.gamma_ratios,
-                viewport_size: [resources.viewport.Width, resources.viewport.Height],
+                viewport_size: [target.viewport.Width, target.viewport.Height],
                 grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
                 subpixel_enhanced_contrast: self.font_info.subpixel_enhanced_contrast,
                 is_bgr: self.font_info.is_bgr as u32,
                 depth_scale,
-                _pad: [0; 2],
+                origin: target.origin,
             }],
         )?;
+        self.pass_viewport = target.viewport;
         unsafe {
             device_context.ClearRenderTargetView(
-                resources
+                target
                     .render_target_view
                     .as_ref()
                     .context("missing render target view")?,
                 clear_color,
             );
             device_context.ClearDepthStencilView(
-                resources
+                target
                     .depth_stencil_view
                     .as_ref()
                     .context("missing depth stencil view")?,
@@ -239,10 +258,10 @@ impl DirectXRenderer {
                 0,
             );
             device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.render_target_view)),
-                resources.depth_stencil_view.as_ref(),
+                Some(slice::from_ref(&target.render_target_view)),
+                target.depth_stencil_view.as_ref(),
             );
-            device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            device_context.RSSetViewports(Some(slice::from_ref(&target.viewport)));
             device_context
                 .VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
             device_context
@@ -253,10 +272,12 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    fn discard_depth_buffer(&self) -> Option<()> {
+    fn discard_depth_buffer(
+        &self,
+        depth_stencil_view: Option<&ID3D11DepthStencilView>,
+    ) -> Option<()> {
         let context1 = self.devices.as_ref()?.device_context1.as_ref()?;
-        let depth_stencil_view = self.resources.as_ref()?.depth_stencil_view.as_ref()?;
-        unsafe { context1.DiscardView(depth_stencil_view) };
+        unsafe { context1.DiscardView(depth_stencil_view?) };
         Some(())
     }
 
@@ -291,6 +312,8 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            // The layers' textures belong to the lost device.
+            self.layer_pool.clear();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -371,14 +394,37 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        self.layer_pool.begin_frame();
+        // Offscreen layers first, so the scene can composite them.
+        let layers = self.render_layers(scene)?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let target = PassTarget {
+            render_target_view: resources.render_target_view.clone(),
+            depth_stencil_view: resources.depth_stencil_view.clone(),
+            viewport: resources.viewport,
+            origin: [0.0, 0.0],
+        };
+        let clear_color = match background_appearance {
+            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+            _ => [0.0f32; 4],
+        };
+        let result = self.draw_pass(scene, &target, &clear_color, &layers);
+        self.release_layers(layers);
+        self.layer_pool.end_frame();
+        result
+    }
+
+    /// Draws `scene` into `target`, compositing its offscreen layers from
+    /// `layers` (indexed like `scene.offscreen_layers`).
+    fn draw_pass(
+        &mut self,
+        scene: &Scene,
+        target: &PassTarget,
+        clear_color: &[f32; 4],
+        layers: &[Option<RenderedLayer>],
+    ) -> Result<()> {
         let depth_scale = quad_depth_scale(scene.quads.len());
-        self.pre_draw(
-            &match background_appearance {
-                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-                _ => [0.0f32; 4],
-            },
-            depth_scale,
-        )?;
+        self.pre_draw(target, clear_color, depth_scale)?;
         self.upload_scene_buffers(scene)?;
 
         let annotation = self
@@ -399,19 +445,34 @@ impl DirectXRenderer {
 
         let mut quad_cursor: u32 = 0;
         let mut path_tile_cursor = 0;
-        for batch in scene.batches() {
+        for batch in scene.batches_with_layers() {
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
 
             // Quad shaders assign each quad its own depth.
             // In every other batch type, the depth is fixed to the position of the quad cursor.
-            if matches!(&batch, PrimitiveBatch::Quads(_)) {
+            if matches!(&batch, SceneBatch::Primitives(PrimitiveBatch::Quads(_))) {
                 self.set_viewport_depth_range(0.0, 1.0)?;
             } else {
                 let depth = quad_depth(quad_cursor, depth_scale);
                 self.set_viewport_depth_range(depth, depth)?;
             }
+
+            let batch = match batch {
+                SceneBatch::Primitives(batch) => batch,
+                SceneBatch::Layers(range) => {
+                    for composite in &scene.layer_composites[range] {
+                        let index = composite.layer as usize;
+                        if let (Some(layer), Some(Some(rendered))) =
+                            (scene.offscreen_layers.get(index), layers.get(index))
+                        {
+                            self.draw_layer_composite(composite, layer, rendered)?;
+                        }
+                    }
+                    continue;
+                }
+            };
 
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
@@ -456,8 +517,224 @@ impl DirectXRenderer {
                 )
             })?;
         }
-        self.discard_depth_buffer();
+        self.discard_depth_buffer(target.depth_stencil_view.as_ref());
         Ok(())
+    }
+
+    /// Draws each offscreen layer of `scene` (and the layers inside them)
+    /// into a pooled texture, blurred when its filter says so.
+    fn render_layers(&mut self, scene: &Scene) -> Result<Vec<Option<RenderedLayer>>> {
+        let mut rendered = Vec::with_capacity(scene.offscreen_layers.len());
+        for layer in &scene.offscreen_layers {
+            match self.render_layer(layer) {
+                Ok(layer) => rendered.push(layer),
+                Err(error) => {
+                    self.release_layers(rendered);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(rendered)
+    }
+
+    fn render_layer(&mut self, layer: &OffscreenLayer) -> Result<Option<RenderedLayer>> {
+        let width = layer.region.size.width.0;
+        let height = layer.region.size.height.0;
+        if width <= 0
+            || height <= 0
+            || width as u32 > MAX_LAYER_SIZE
+            || height as u32 > MAX_LAYER_SIZE
+        {
+            return Ok(None);
+        }
+        let (width, height) = (width as u32, height as u32);
+        let color = self.draw_layer_scene(&layer.content, layer, width, height)?;
+        let mask = match &layer.mask {
+            Some(mask) => match self.draw_layer_scene(mask, layer, width, height) {
+                Ok(mask) => Some(mask),
+                Err(error) => {
+                    self.layer_pool.release(color);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        let rendered = RenderedLayer { color, mask };
+        if layer.filter.blur > 0.0 {
+            if let Err(error) = self.blur_layer(&rendered.color, layer, width, height) {
+                self.release_layers(vec![Some(rendered)]);
+                return Err(error);
+            }
+        }
+        Ok(Some(rendered))
+    }
+
+    /// Draws `scene`, a layer's content or mask, into a pooled texture
+    /// covering the layer's region.
+    fn draw_layer_scene(
+        &mut self,
+        scene: &Scene,
+        layer: &OffscreenLayer,
+        width: u32,
+        height: u32,
+    ) -> Result<LayerTexture> {
+        let children = self.render_layers(scene)?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let texture = match self.layer_pool.acquire(&devices.device, width, height) {
+            Ok(texture) => texture,
+            Err(error) => {
+                self.release_layers(children);
+                return Err(error);
+            }
+        };
+        let target = PassTarget {
+            render_target_view: texture.render_target_view.clone(),
+            depth_stencil_view: texture.depth_stencil_view.clone(),
+            viewport: D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            },
+            origin: [
+                layer.region.origin.x.0 as f32,
+                layer.region.origin.y.0 as f32,
+            ],
+        };
+        let result = self.draw_pass(scene, &target, &[0.0; 4], &children);
+        self.release_layers(children);
+        match result {
+            Ok(()) => Ok(texture),
+            Err(error) => {
+                self.layer_pool.release(texture);
+                Err(error)
+            }
+        }
+    }
+
+    /// Blurs a layer's texture in place: horizontally into a scratch
+    /// texture, then vertically back.
+    fn blur_layer(
+        &mut self,
+        texture: &LayerTexture,
+        layer: &OffscreenLayer,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let scratch = self.layer_pool.acquire(&devices.device, width, height)?;
+        let first = self.blur_pass(texture, &scratch, layer, [1.0, 0.0], width, height);
+        let second = first
+            .and_then(|()| self.blur_pass(&scratch, texture, layer, [0.0, 1.0], width, height));
+        self.layer_pool.release(scratch);
+        second
+    }
+
+    fn blur_pass(
+        &self,
+        source: &LayerTexture,
+        destination: &LayerTexture,
+        layer: &OffscreenLayer,
+        direction: [f32; 2],
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let context = &devices.device_context;
+        let params = LayerParams {
+            region: [0.0, 0.0, width as f32, height as f32],
+            texture_size: [source.width as f32, source.height as f32],
+            blur_direction: direction,
+            blur_sigma: layer.filter.blur,
+            ..LayerParams::default()
+        };
+        update_buffer(
+            context,
+            self.globals
+                .layer_params_buffer
+                .as_ref()
+                .context("layer params buffer missing")?,
+            &[params],
+        )?;
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        unsafe {
+            // The source may still be bound as a render target, and the
+            // destination as a shader resource.
+            context.OMSetRenderTargets(None, None);
+            context.PSSetShaderResources(0, Some(&[None]));
+            context.ClearRenderTargetView(
+                destination
+                    .render_target_view
+                    .as_ref()
+                    .context("missing layer render target view")?,
+                &[0.0; 4],
+            );
+            context
+                .OMSetRenderTargets(Some(slice::from_ref(&destination.render_target_view)), None);
+            context.RSSetViewports(Some(slice::from_ref(&viewport)));
+        }
+        self.pipelines
+            .layer_blur
+            .bind(context, &self.globals, &source.shader_resource_view, None);
+        unsafe {
+            context.Draw(4, 0);
+            context.PSSetShaderResources(0, Some(&[None]));
+        }
+        Ok(())
+    }
+
+    fn draw_layer_composite(
+        &self,
+        composite: &LayerComposite,
+        layer: &OffscreenLayer,
+        rendered: &RenderedLayer,
+    ) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let context = &devices.device_context;
+        let params =
+            LayerParams::for_composite(composite, layer, &rendered.color, rendered.mask.as_ref());
+        update_buffer(
+            context,
+            self.globals
+                .layer_params_buffer
+                .as_ref()
+                .context("layer params buffer missing")?,
+            &[params],
+        )?;
+        self.pipelines.layer_composite.bind(
+            context,
+            &self.globals,
+            &rendered.color.shader_resource_view,
+            rendered
+                .mask
+                .as_ref()
+                .map(|mask| &mask.shader_resource_view),
+        );
+        unsafe {
+            context.Draw(4, 0);
+            // Unbound, so the textures can be render targets again.
+            context.PSSetShaderResources(0, Some(&[None]));
+            context.PSSetShaderResources(5, Some(&[None]));
+        }
+        Ok(())
+    }
+
+    fn release_layers(&mut self, layers: Vec<Option<RenderedLayer>>) {
+        for layer in layers.into_iter().flatten() {
+            self.layer_pool.release(layer.color);
+            if let Some(mask) = layer.mask {
+                self.layer_pool.release(mask);
+            }
+        }
     }
 
     /// Render `scene` to an offscreen CPU image **without presenting** so
@@ -540,12 +817,11 @@ impl DirectXRenderer {
 
     fn set_viewport_depth_range(&self, minimum_depth: f32, maximum_depth: f32) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
         // Equal endpoints collapse every shader depth to the same value.
         let viewport = D3D11_VIEWPORT {
             MinDepth: minimum_depth,
             MaxDepth: maximum_depth,
-            ..resources.viewport
+            ..self.pass_viewport
         };
         unsafe {
             devices
@@ -1018,6 +1294,18 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
         let opaque_quad_pipeline = OpaqueQuadPipeline::new(device)?;
+        let layer_composite = LayerPipeline::new(
+            device,
+            ShaderModule::LayerComposite,
+            create_premultiplied_blend_state(device)?,
+            create_depth_stencil_state(device, D3D11_DEPTH_WRITE_MASK_ZERO)?,
+        )?;
+        let layer_blur = LayerPipeline::new(
+            device,
+            ShaderModule::LayerBlur,
+            create_opaque_blend_state(device)?,
+            create_disabled_depth_stencil_state(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1030,6 +1318,8 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            layer_composite,
+            layer_blur,
         })
     }
 }
@@ -1061,6 +1351,25 @@ impl DirectXGlobalElements {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
         let global_params_buffer = create_constant_buffer::<GlobalParams>(device)?;
         let batch_params_buffer = create_constant_buffer::<BatchParams>(device)?;
+        let layer_params_buffer = create_constant_buffer::<LayerParams>(device)?;
+        // Clamped, so a layer's edge never samples the opposite edge.
+        let layer_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
 
         let sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
@@ -1084,6 +1393,8 @@ impl DirectXGlobalElements {
             global_params_buffer,
             batch_params_buffer,
             sampler,
+            layer_params_buffer,
+            layer_sampler,
         })
     }
 }
@@ -1097,7 +1408,291 @@ struct GlobalParams {
     subpixel_enhanced_contrast: f32,
     is_bgr: u32,
     depth_scale: f32,
-    _pad: [u32; 2],
+    /// Where the target's top-left pixel is in the window's device pixels.
+    origin: [f32; 2],
+}
+
+/// The largest side of an offscreen layer's texture (Direct3D 11's limit).
+const MAX_LAYER_SIZE: u32 = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+
+/// What a pass draws into: the window's back buffer or a layer's texture.
+struct PassTarget {
+    render_target_view: Option<ID3D11RenderTargetView>,
+    depth_stencil_view: Option<ID3D11DepthStencilView>,
+    viewport: D3D11_VIEWPORT,
+    origin: [f32; 2],
+}
+
+/// A texture an offscreen layer is drawn into, with its depth buffer.
+struct LayerTexture {
+    _texture: ID3D11Texture2D,
+    render_target_view: Option<ID3D11RenderTargetView>,
+    shader_resource_view: Option<ID3D11ShaderResourceView>,
+    _depth_texture: ID3D11Texture2D,
+    depth_stencil_view: Option<ID3D11DepthStencilView>,
+    width: u32,
+    height: u32,
+    last_used_frame: u64,
+}
+
+/// A layer drawn this frame, ready to composite.
+struct RenderedLayer {
+    color: LayerTexture,
+    mask: Option<LayerTexture>,
+}
+
+/// Layer textures kept between frames, so a layer that animates reuses its
+/// texture instead of creating one every frame. Sizes are rounded up so
+/// layers that grow a little still fit; textures unused for a while are
+/// dropped.
+#[derive(Default)]
+struct LayerTexturePool {
+    free: Vec<LayerTexture>,
+    frame: u64,
+}
+
+/// How many frames an unused layer texture is kept.
+const LAYER_TEXTURE_IDLE_FRAMES: u64 = 120;
+/// Texture sizes are multiples of this.
+const LAYER_TEXTURE_GRANULARITY: u32 = 64;
+
+impl LayerTexturePool {
+    fn begin_frame(&mut self) {
+        self.frame += 1;
+    }
+
+    fn end_frame(&mut self) {
+        let frame = self.frame;
+        self.free
+            .retain(|texture| frame - texture.last_used_frame <= LAYER_TEXTURE_IDLE_FRAMES);
+    }
+
+    fn clear(&mut self) {
+        self.free.clear();
+    }
+
+    /// A texture at least `width` by `height`, from the pool when one fits
+    /// without wasting much of it.
+    fn acquire(&mut self, device: &ID3D11Device, width: u32, height: u32) -> Result<LayerTexture> {
+        let round = |size: u32| {
+            size.next_multiple_of(LAYER_TEXTURE_GRANULARITY)
+                .min(MAX_LAYER_SIZE)
+                .max(size)
+        };
+        let (rounded_width, rounded_height) = (round(width), round(height));
+        let area = |texture: &LayerTexture| texture.width as u64 * texture.height as u64;
+        // Fits, without more than twice the rounded size on either side.
+        let best = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, texture)| {
+                texture.width >= width
+                    && texture.height >= height
+                    && texture.width <= rounded_width * 2
+                    && texture.height <= rounded_height * 2
+            })
+            .min_by_key(|(_, texture)| area(texture))
+            .map(|(index, _)| index);
+        if let Some(index) = best {
+            return Ok(self.free.swap_remove(index));
+        }
+        create_layer_texture(device, rounded_width, rounded_height)
+    }
+
+    fn release(&mut self, mut texture: LayerTexture) {
+        texture.last_used_frame = self.frame;
+        self.free.push(texture);
+    }
+}
+
+fn create_layer_texture(device: &ID3D11Device, width: u32, height: u32) -> Result<LayerTexture> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: RENDER_TARGET_FORMAT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+    let texture = texture.context("creating a layer texture")?;
+    let mut render_target_view = None;
+    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut render_target_view))? };
+    let mut shader_resource_view = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
+    let (depth_texture, depth_stencil_view) =
+        create_depth_stencil_texture_and_view(device, width, height)?;
+    Ok(LayerTexture {
+        _texture: texture,
+        render_target_view,
+        shader_resource_view,
+        _depth_texture: depth_texture,
+        depth_stencil_view,
+        width,
+        height,
+        last_used_frame: 0,
+    })
+}
+
+/// The `LayerParams` constant buffer of `shaders.hlsl`.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct LayerParams {
+    region: [f32; 4],
+    texture_size: [f32; 2],
+    opacity: f32,
+    brightness: f32,
+    matrix: [f32; 4],
+    translation: [f32; 2],
+    grayscale: f32,
+    mask_stop_count: u32,
+    clip: [f32; 4],
+    mask_gradient: [f32; 4],
+    mask_stops: [[f32; 4]; 4],
+    blur_direction: [f32; 2],
+    blur_sigma: f32,
+    _pad: f32,
+    mask_texture_size: [f32; 2],
+    _pad2: [f32; 2],
+}
+
+impl Default for LayerParams {
+    fn default() -> Self {
+        Self {
+            region: [0.0; 4],
+            texture_size: [1.0; 2],
+            opacity: 1.0,
+            brightness: 1.0,
+            matrix: [1.0, 0.0, 0.0, 1.0],
+            translation: [0.0; 2],
+            grayscale: 0.0,
+            mask_stop_count: 0,
+            clip: [0.0; 4],
+            mask_gradient: [0.0; 4],
+            mask_stops: [[0.0; 4]; 4],
+            blur_direction: [0.0; 2],
+            blur_sigma: 0.0,
+            _pad: 0.0,
+            mask_texture_size: [1.0; 2],
+            _pad2: [0.0; 2],
+        }
+    }
+}
+
+impl LayerParams {
+    fn for_composite(
+        composite: &LayerComposite,
+        layer: &OffscreenLayer,
+        texture: &LayerTexture,
+        mask: Option<&LayerTexture>,
+    ) -> Self {
+        let has_mask = mask.is_some();
+        let filter = &layer.filter;
+        let [[a, b], [c, d]] = composite.transformation.rotation_scale;
+        let mut mask_stops = [[0.0; 4]; 4];
+        for (index, stop) in filter.mask_stops.iter().enumerate() {
+            let pair = &mut mask_stops[index / 2];
+            pair[(index % 2) * 2] = stop[0];
+            pair[(index % 2) * 2 + 1] = stop[1];
+        }
+        let clip = composite.content_mask.bounds;
+        Self {
+            region: [
+                composite.bounds.origin.x.0,
+                composite.bounds.origin.y.0,
+                composite.bounds.size.width.0,
+                composite.bounds.size.height.0,
+            ],
+            texture_size: [texture.width as f32, texture.height as f32],
+            opacity: filter.opacity,
+            brightness: filter.brightness,
+            matrix: [a, b, c, d],
+            translation: composite.transformation.translation,
+            grayscale: filter.grayscale,
+            mask_stop_count: filter.mask_stop_count,
+            clip: [
+                clip.origin.x.0,
+                clip.origin.y.0,
+                clip.size.width.0,
+                clip.size.height.0,
+            ],
+            mask_gradient: [
+                filter.mask_gradient[0],
+                filter.mask_gradient[1],
+                filter.mask_gradient[2],
+                if has_mask { 1.0 } else { 0.0 },
+            ],
+            mask_stops,
+            mask_texture_size: mask
+                .map_or([1.0; 2], |mask| [mask.width as f32, mask.height as f32]),
+            ..Self::default()
+        }
+    }
+}
+
+/// The shaders and fixed state of an offscreen layer pass: compositing or
+/// blurring (Astryx patch R3).
+struct LayerPipeline {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+    blend_state: ID3D11BlendState,
+    depth_stencil_state: ID3D11DepthStencilState,
+}
+
+impl LayerPipeline {
+    fn new(
+        device: &ID3D11Device,
+        module: ShaderModule,
+        blend_state: ID3D11BlendState,
+        depth_stencil_state: ID3D11DepthStencilState,
+    ) -> Result<Self> {
+        let vertex = {
+            let raw_shader = RawShaderBytes::new(module, ShaderTarget::Vertex)?;
+            create_vertex_shader(device, raw_shader.as_bytes())?
+        };
+        let fragment = {
+            let raw_shader = RawShaderBytes::new(module, ShaderTarget::Fragment)?;
+            create_fragment_shader(device, raw_shader.as_bytes())?
+        };
+        Ok(Self {
+            vertex,
+            fragment,
+            blend_state,
+            depth_stencil_state,
+        })
+    }
+
+    fn bind(
+        &self,
+        context: &ID3D11DeviceContext,
+        globals: &DirectXGlobalElements,
+        texture: &Option<ID3D11ShaderResourceView>,
+        mask: Option<&Option<ID3D11ShaderResourceView>>,
+    ) {
+        unsafe {
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context.VSSetShader(&self.vertex, None);
+            context.PSSetShader(&self.fragment, None);
+            context.OMSetBlendState(&self.blend_state, None, 0xFFFFFFFF);
+            context.OMSetDepthStencilState(&self.depth_stencil_state, 0);
+            context.VSSetConstantBuffers(2, Some(slice::from_ref(&globals.layer_params_buffer)));
+            context.PSSetConstantBuffers(2, Some(slice::from_ref(&globals.layer_params_buffer)));
+            context.PSSetSamplers(1, Some(slice::from_ref(&globals.layer_sampler)));
+            context.PSSetShaderResources(0, Some(slice::from_ref(texture)));
+            if let Some(mask) = mask {
+                context.PSSetShaderResources(5, Some(slice::from_ref(mask)));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1525,6 +2120,38 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     }
 }
 
+/// Blends a premultiplied color, as an offscreen layer's texture holds.
+fn create_premultiplied_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = true.into();
+    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+fn create_disabled_depth_stencil_state(device: &ID3D11Device) -> Result<ID3D11DepthStencilState> {
+    let desc = D3D11_DEPTH_STENCIL_DESC {
+        DepthEnable: false.into(),
+        DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ZERO,
+        DepthFunc: D3D11_COMPARISON_ALWAYS,
+        ..Default::default()
+    };
+    unsafe {
+        let mut state = None;
+        device.CreateDepthStencilState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
 #[inline]
 fn create_opaque_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
@@ -1745,6 +2372,8 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        LayerComposite,
+        LayerBlur,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1817,6 +2446,14 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::LayerComposite => match target {
+                    ShaderTarget::Vertex => LAYER_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => LAYER_COMPOSITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::LayerBlur => match target {
+                    ShaderTarget::Vertex => LAYER_BLUR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => LAYER_BLUR_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1898,6 +2535,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::LayerComposite => "layer_composite",
+                ShaderModule::LayerBlur => "layer_blur",
             }
         }
     }

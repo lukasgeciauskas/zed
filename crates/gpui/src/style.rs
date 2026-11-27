@@ -327,6 +327,34 @@ pub struct Style {
     /// like CSS `transform-origin`. Defaults to the center.
     pub transform_origin: Option<Point<f32>>,
 
+    /// Rotates the element and its subtree clockwise when painted, in
+    /// radians, around `transform_origin`, like CSS `rotate`. The subtree is
+    /// drawn to an offscreen layer that is composited rotated (Astryx patch
+    /// R3), with the element's `scale` and `translate`.
+    pub rotate: Option<f32>,
+
+    /// Fades the element and its subtree as one group, like CSS `opacity`:
+    /// overlapping children don't show through each other. The subtree is
+    /// drawn to an offscreen layer (Astryx patch R3); `opacity` instead
+    /// fades each primitive.
+    pub layer_opacity: Option<f32>,
+
+    /// Blurs the element and its subtree, like CSS `filter: blur()` (Astryx
+    /// patch R3).
+    pub filter_blur: Option<Pixels>,
+
+    /// Scales the colors of the element and its subtree, like CSS
+    /// `filter: brightness()` (Astryx patch R3).
+    pub filter_brightness: Option<f32>,
+
+    /// Desaturates the element and its subtree, from 0 to 1, like CSS
+    /// `filter: grayscale()` (Astryx patch R3).
+    pub filter_grayscale: Option<f32>,
+
+    /// Masks the element and its subtree's alpha, like CSS `mask-image`
+    /// (Astryx patch R3).
+    pub mask: Option<crate::LayerMask>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -675,6 +703,58 @@ impl Style {
         )
     }
 
+    /// Whether `rotate` turns the element, which then composites its `scale`
+    /// and `translate` with its offscreen layer rather than through
+    /// [`Self::element_transform`].
+    pub fn rotates(&self) -> bool {
+        self.rotate.is_some_and(|angle| angle != 0.0)
+    }
+
+    /// The offscreen layer `rotate`, `layer_opacity`, the filters and `mask`
+    /// ask for (Astryx patch R3) for an element at `bounds`, kept for
+    /// snapshots when `retain` holds, or `None` when nothing does.
+    pub fn layer_effects(
+        &self,
+        bounds: Bounds<Pixels>,
+        rem_size: Pixels,
+        retain: bool,
+    ) -> Option<crate::LayerEffects> {
+        let rotates = self.rotates();
+        if !rotates
+            && self.layer_opacity.is_none()
+            && self.filter_blur.is_none()
+            && self.filter_brightness.is_none()
+            && self.filter_grayscale.is_none()
+            && self.mask.is_none()
+            && !retain
+        {
+            return None;
+        }
+        let mut effects = crate::LayerEffects::default();
+        if rotates {
+            effects.rotate = crate::Radians(self.rotate.unwrap_or_default());
+            if let Some(scale) = self.scale {
+                effects.scale = size(scale.x, scale.y);
+            }
+            if let Some(translate) = self.translate {
+                effects.translate = point(
+                    translate.x.to_pixels(bounds.size.width.into(), rem_size),
+                    translate.y.to_pixels(bounds.size.height.into(), rem_size),
+                );
+            }
+            if let Some(origin) = self.transform_origin {
+                effects.transform_origin = origin;
+            }
+        }
+        effects.opacity = self.layer_opacity.unwrap_or(1.0);
+        effects.blur = self.filter_blur.unwrap_or_default();
+        effects.brightness = self.filter_brightness.unwrap_or(1.0);
+        effects.grayscale = self.filter_grayscale.unwrap_or(0.0);
+        effects.mask = self.mask.clone();
+        effects.retain = retain;
+        Some(effects)
+    }
+
     /// Returns true if the style is visible and the background is opaque.
     pub fn has_opaque_background(&self) -> bool {
         self.background
@@ -874,6 +954,12 @@ impl Default for Style {
             scale: None,
             translate: None,
             transform_origin: None,
+            rotate: None,
+            layer_opacity: None,
+            filter_blur: None,
+            filter_brightness: None,
+            filter_grayscale: None,
+            mask: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

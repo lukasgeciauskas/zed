@@ -3,8 +3,9 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Bounds, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch, ScaledPixels,
-    Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
+    AtlasTextureId, Bounds, DevicePixels, GpuSpecs, LayerComposite, OffscreenLayer, PaintedPath,
+    PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size, get_gamma_correction_ratios, quad_depth,
+    quad_depth_scale,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -68,6 +69,9 @@ struct GlobalParams {
     quad_count: u32,
     premultiplied_alpha: u32,
     pad: u32,
+    /// Where the target's top-left pixel is in the window's device pixels.
+    origin: [f32; 2],
+    pad2: [u32; 2],
 }
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -133,6 +137,8 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    layer_composite: wgpu::RenderPipeline,
+    layer_blur: wgpu::RenderPipeline,
     premultiplied_alpha: bool,
 }
 
@@ -176,6 +182,7 @@ struct WgpuBindGroupLayouts {
     path_tiles: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    layer: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -204,6 +211,8 @@ struct WgpuResources {
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     instance_data: InstanceData,
+    /// Bound for a layer's painted mask when it has none.
+    layer_mask_placeholder: wgpu::TextureView,
 }
 
 struct CachedTextureBindGroup {
@@ -225,6 +234,10 @@ struct WgpuRendererCore {
     transient_attachments: bool,
     adapter_info: wgpu::AdapterInfo,
     depth_texture: Option<DepthTexture>,
+    /// Textures for offscreen layers, kept between frames (Astryx patch R3).
+    layer_pool: LayerTexturePool,
+    /// The format of the target, which layers' textures share.
+    layer_format: wgpu::TextureFormat,
     /// Read by the headless renderer to create its render target.
     #[cfg(all(
         not(target_family = "wasm"),
@@ -676,12 +689,58 @@ impl WgpuRendererCore {
             ],
         });
 
+        let layer =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("layer_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(
+                                std::mem::size_of::<LayerParams>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             path_tiles,
             texture,
             surfaces,
+            layer,
         }
     }
 
@@ -982,6 +1041,60 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
+        // Offscreen layers (Astryx patch R3): their textures hold
+        // premultiplied colors whatever the target's alpha mode.
+        let layer_composite = create_pipeline(
+            "layer_composite",
+            "vs_layer_composite",
+            "fs_layer_composite",
+            &layouts.globals,
+            &layouts.layer,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            false,
+            &shader_module,
+        );
+        let layer_blur = {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("layer_blur_layout"),
+                bind_group_layouts: &[Some(&layouts.globals), Some(&layouts.layer)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("layer_blur"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_layer_blur"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_layer_blur"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
         WgpuPipelines {
             quads,
             opaque_quads,
@@ -992,6 +1105,8 @@ impl WgpuRendererCore {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            layer_composite,
+            layer_blur,
             premultiplied_alpha,
         }
     }
@@ -1269,6 +1384,22 @@ impl WgpuRendererCore {
             ],
         });
         let max_texture_size = device.limits().max_texture_dimension_2d;
+        let layer_mask_placeholder = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("layer_mask_placeholder"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         Self {
             resources: WgpuResources {
@@ -1281,6 +1412,7 @@ impl WgpuRendererCore {
                 globals_buffer,
                 globals_bind_group,
                 instance_data,
+                layer_mask_placeholder,
             },
             atlas,
             gamma_offset,
@@ -1294,6 +1426,8 @@ impl WgpuRendererCore {
             transient_attachments: context.supports_transient_attachments(),
             adapter_info: context.adapter.get_info(),
             depth_texture: None,
+            layer_pool: LayerTexturePool::default(),
+            layer_format: target_format,
             #[cfg(all(
                 not(target_family = "wasm"),
                 any(test, feature = "bench-support", feature = "test-support")
@@ -1312,6 +1446,10 @@ impl WgpuRendererCore {
         surface_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
     ) {
+        if surface_format != self.layer_format {
+            self.layer_format = surface_format;
+            self.layer_pool.clear();
+        }
         self.resources.pipelines = Self::create_pipelines(
             &self.resources.device,
             &self.resources.bind_group_layouts,
@@ -1359,20 +1497,258 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, size, clear_color)
-            .inspect_err(|_| {
-                // Queue writes are staged before encoding; flush them even if the frame fails.
-                self.resources.queue.submit(std::iter::empty());
-            })
+        self.layer_pool.begin_frame();
+        self.prepare_texture_bind_groups(scene);
+        let result = self.render_frame_with_layers(scene, target_view, size, clear_color);
+        self.layer_pool.end_frame();
+        result.inspect_err(|_| {
+            // Queue writes are staged before encoding; flush them even if the frame fails.
+            self.resources.queue.submit(std::iter::empty());
+        })
     }
 
-    fn record_frame(
+    /// Draws the scene's offscreen layers into pooled textures, each
+    /// submitted on its own, then the scene, compositing them.
+    fn render_frame_with_layers(
         &mut self,
         scene: &Scene,
-        frame_view: &wgpu::TextureView,
+        target_view: &wgpu::TextureView,
         size: Size<DevicePixels>,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
+        let layers = self.render_layers(scene)?;
+        self.ensure_depth_texture(size);
+        let depth_view = self
+            .depth_texture
+            .as_ref()
+            .context("depth texture missing")?
+            .view
+            .clone();
+        let target = PassTarget {
+            view: target_view,
+            depth_view: &depth_view,
+            size,
+            origin: [0.0, 0.0],
+        };
+        let result = self.record_frame(scene, &target, clear_color, &layers);
+        self.release_layers(layers);
+        result
+    }
+
+    /// Draws each offscreen layer of `scene` (and the layers inside them)
+    /// into a pooled texture, blurred when its filter says so.
+    fn render_layers(&mut self, scene: &Scene) -> Result<Vec<Option<RenderedLayer>>> {
+        let mut rendered = Vec::with_capacity(scene.offscreen_layers.len());
+        for layer in &scene.offscreen_layers {
+            match self.render_layer(layer) {
+                Ok(layer) => rendered.push(layer),
+                Err(error) => {
+                    self.release_layers(rendered);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(rendered)
+    }
+
+    fn render_layer(&mut self, layer: &OffscreenLayer) -> Result<Option<RenderedLayer>> {
+        let width = layer.region.size.width.0;
+        let height = layer.region.size.height.0;
+        if width <= 0
+            || height <= 0
+            || width as u32 > self.max_texture_size
+            || height as u32 > self.max_texture_size
+        {
+            return Ok(None);
+        }
+        let (width, height) = (width as u32, height as u32);
+        let color = self.draw_layer_scene(&layer.content, layer, width, height)?;
+        let mask = match &layer.mask {
+            Some(mask) => match self.draw_layer_scene(mask, layer, width, height) {
+                Ok(mask) => Some(mask),
+                Err(error) => {
+                    self.layer_pool.release(color);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        let rendered = RenderedLayer { color, mask };
+        if layer.filter.blur > 0.0
+            && let Err(error) = self.blur_layer(&rendered.color, layer, width, height)
+        {
+            self.release_layers(vec![Some(rendered)]);
+            return Err(error);
+        }
+        Ok(Some(rendered))
+    }
+
+    /// Draws `scene`, a layer's content or mask, into a pooled texture
+    /// covering the layer's region.
+    fn draw_layer_scene(
+        &mut self,
+        scene: &Scene,
+        layer: &OffscreenLayer,
+        width: u32,
+        height: u32,
+    ) -> Result<LayerTexture> {
+        let children = self.render_layers(scene)?;
+        let texture = self.layer_pool.acquire(
+            &self.resources.device,
+            self.layer_format,
+            width,
+            height,
+            self.max_texture_size,
+        );
+        let target = PassTarget {
+            view: &texture.view,
+            depth_view: &texture.depth_view,
+            size: Size {
+                width: DevicePixels(width as i32),
+                height: DevicePixels(height as i32),
+            },
+            origin: [
+                layer.region.origin.x.0 as f32,
+                layer.region.origin.y.0 as f32,
+            ],
+        };
+        let result = self.record_frame(scene, &target, wgpu::Color::TRANSPARENT, &children);
+        self.release_layers(children);
+        match result {
+            Ok(_) => Ok(texture),
+            Err(error) => {
+                self.layer_pool.release(texture);
+                Err(error)
+            }
+        }
+    }
+
+    /// Blurs a layer's texture in place: horizontally into a scratch
+    /// texture, then vertically back.
+    fn blur_layer(
+        &mut self,
+        texture: &LayerTexture,
+        layer: &OffscreenLayer,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let scratch = self.layer_pool.acquire(
+            &self.resources.device,
+            self.layer_format,
+            width,
+            height,
+            self.max_texture_size,
+        );
+        let blur_params = |source: &LayerTexture, direction: [f32; 2]| LayerParams {
+            region: [0.0, 0.0, width as f32, height as f32],
+            texture_size: [source.width as f32, source.height as f32],
+            blur_direction: direction,
+            blur_sigma: layer.filter.blur,
+            ..LayerParams::default()
+        };
+        let horizontal =
+            self.layer_bind_group(&blur_params(texture, [1.0, 0.0]), &texture.view, None);
+        let vertical =
+            self.layer_bind_group(&blur_params(&scratch, [0.0, 1.0]), &scratch.view, None);
+        let mut encoder =
+            self.resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("layer_blur_encoder"),
+                });
+        for (destination, bind_group) in [(&scratch, &horizontal), (texture, &vertical)] {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("layer_blur_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &destination.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                ..Default::default()
+            });
+            pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+            pass.set_pipeline(&self.resources.pipelines.layer_blur);
+            pass.set_bind_group(0, &self.resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        self.resources
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+        self.layer_pool.release(scratch);
+        Ok(())
+    }
+
+    /// A bind group for one layer draw: its parameters, its texture and its
+    /// painted mask.
+    fn layer_bind_group(
+        &self,
+        params: &LayerParams,
+        texture: &wgpu::TextureView,
+        mask: Option<&wgpu::TextureView>,
+    ) -> wgpu::BindGroup {
+        let resources = &self.resources;
+        let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("layer_params"),
+            size: std::mem::size_of::<LayerParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        resources
+            .queue
+            .write_buffer(&buffer, 0, bytemuck::bytes_of(params));
+        resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("layer_bind_group"),
+                layout: &resources.bind_group_layouts.layer,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(texture),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            mask.unwrap_or(&resources.layer_mask_placeholder),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                    },
+                ],
+            })
+    }
+
+    fn release_layers(&mut self, layers: Vec<Option<RenderedLayer>>) {
+        for layer in layers.into_iter().flatten() {
+            self.layer_pool.release(layer.color);
+            if let Some(mask) = layer.mask {
+                self.layer_pool.release(mask);
+            }
+        }
+    }
+
+    /// Draws `scene` into `target` and submits it, compositing its offscreen
+    /// layers from `layers` (indexed like `scene.offscreen_layers`).
+    fn record_frame(
+        &mut self,
+        scene: &Scene,
+        target: &PassTarget<'_>,
+        clear_color: wgpu::Color,
+        layers: &[Option<RenderedLayer>],
+    ) -> Result<wgpu::SubmissionIndex> {
+        let frame_view = target.view;
+        let size = target.size;
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1397,19 +1773,39 @@ impl WgpuRendererCore {
             quad_count: scene.quads.len() as u32,
             premultiplied_alpha: self.resources().pipelines.premultiplied_alpha as u32,
             pad: 0,
+            origin: target.origin,
+            pad2: [0; 2],
         };
         self.resources().queue.write_buffer(
             &self.resources().globals_buffer,
             0,
             bytemuck::bytes_of(&globals),
         );
-        self.prepare_texture_bind_groups(scene);
-        self.ensure_depth_texture(size);
-        let depth_view = &self
-            .depth_texture
-            .as_ref()
-            .context("depth texture missing")?
-            .view;
+        let depth_view = target.depth_view;
+        // Each composite's parameters and textures, made before the pass.
+        let composite_bind_groups = scene
+            .layer_composites
+            .iter()
+            .map(|composite| {
+                let index = composite.layer as usize;
+                let (Some(layer), Some(Some(rendered))) =
+                    (scene.offscreen_layers.get(index), layers.get(index))
+                else {
+                    return None;
+                };
+                let params = LayerParams::for_composite(
+                    composite,
+                    layer,
+                    &rendered.color,
+                    rendered.mask.as_ref(),
+                );
+                Some(self.layer_bind_group(
+                    &params,
+                    &rendered.color.view,
+                    rendered.mask.as_ref().map(|mask| &mask.view),
+                ))
+            })
+            .collect::<Vec<_>>();
         // Quads are written first, so their instance indices are their
         // indices in `scene.quads` on both transports, which the quad depths
         // rely on.
@@ -1445,6 +1841,15 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
             pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+            // A layer's texture can be larger than the region it covers.
+            pass.set_viewport(
+                0.0,
+                0.0,
+                size.width.0 as f32,
+                size.height.0 as f32,
+                0.0,
+                1.0,
+            );
 
             self.draw_instances(
                 &instance_bindings.quads,
@@ -1457,15 +1862,16 @@ impl WgpuRendererCore {
             let viewport_height = size.height.0 as f32;
             let mut quad_cursor: u32 = 0;
             let mut path_tile_cursor = 0;
-            for batch in scene.batches() {
+            for batch in scene.batches_with_layers() {
                 // Quad shaders assign each quad its own depth.
                 // In every other batch type, the depth is fixed to the position of the quad cursor.
-                let (minimum_depth, maximum_depth) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
-                    (0.0, 1.0)
-                } else {
-                    let depth = quad_depth(quad_cursor, depth_scale);
-                    (depth, depth)
-                };
+                let (minimum_depth, maximum_depth) =
+                    if matches!(&batch, SceneBatch::Primitives(PrimitiveBatch::Quads(_))) {
+                        (0.0, 1.0)
+                    } else {
+                        let depth = quad_depth(quad_cursor, depth_scale);
+                        (depth, depth)
+                    };
                 pass.set_viewport(
                     0.0,
                     0.0,
@@ -1474,6 +1880,18 @@ impl WgpuRendererCore {
                     minimum_depth,
                     maximum_depth,
                 );
+
+                let batch = match batch {
+                    SceneBatch::Primitives(batch) => batch,
+                    SceneBatch::Layers(range) => {
+                        for bind_group in composite_bind_groups[range].iter().flatten() {
+                            pass.set_pipeline(&self.resources().pipelines.layer_composite);
+                            pass.set_bind_group(1, bind_group, &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                        continue;
+                    }
+                };
 
                 match batch {
                     PrimitiveBatch::Quads(range) => {
@@ -1657,8 +2075,8 @@ impl WgpuRendererCore {
             })
     }
 
-    fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
-        let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
+    /// The atlas textures `scene` samples, its offscreen layers' included.
+    fn collect_texture_ids(scene: &Scene, texture_ids: &mut SmallVec<[AtlasTextureId; 8]>) {
         for batch in scene.batches() {
             let texture_id = match batch {
                 PrimitiveBatch::MonochromeSprites { texture_id, .. }
@@ -1670,6 +2088,17 @@ impl WgpuRendererCore {
                 texture_ids.push(texture_id);
             }
         }
+        for layer in &scene.offscreen_layers {
+            Self::collect_texture_ids(&layer.content, texture_ids);
+            if let Some(mask) = &layer.mask {
+                Self::collect_texture_ids(mask, texture_ids);
+            }
+        }
+    }
+
+    fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
+        let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
+        Self::collect_texture_ids(scene, &mut texture_ids);
 
         self.resources_mut()
             .atlas_texture_bind_groups
@@ -2514,6 +2943,234 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
     }
 }
 
+/// What a pass draws into: the frame or a layer's texture (Astryx patch R3).
+struct PassTarget<'a> {
+    view: &'a wgpu::TextureView,
+    depth_view: &'a wgpu::TextureView,
+    /// The viewport, from the target's top-left.
+    size: Size<DevicePixels>,
+    /// Where the target's top-left pixel is in the window's device pixels.
+    origin: [f32; 2],
+}
+
+/// A texture an offscreen layer is drawn into, with its depth buffer.
+struct LayerTexture {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    _depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    last_used_frame: u64,
+}
+
+/// A layer drawn this frame, ready to composite.
+struct RenderedLayer {
+    color: LayerTexture,
+    mask: Option<LayerTexture>,
+}
+
+/// Layer textures kept between frames, so a layer that animates reuses its
+/// texture instead of creating one every frame. Sizes are rounded up so
+/// layers that grow a little still fit; textures unused for a while are
+/// dropped.
+#[derive(Default)]
+struct LayerTexturePool {
+    free: Vec<LayerTexture>,
+    frame: u64,
+}
+
+/// How many frames an unused layer texture is kept.
+const LAYER_TEXTURE_IDLE_FRAMES: u64 = 120;
+/// Texture sizes are multiples of this.
+const LAYER_TEXTURE_GRANULARITY: u32 = 64;
+
+impl LayerTexturePool {
+    fn begin_frame(&mut self) {
+        self.frame += 1;
+    }
+
+    fn end_frame(&mut self) {
+        let frame = self.frame;
+        self.free
+            .retain(|texture| frame - texture.last_used_frame <= LAYER_TEXTURE_IDLE_FRAMES);
+    }
+
+    fn clear(&mut self) {
+        self.free.clear();
+    }
+
+    /// A texture at least `width` by `height`, from the pool when one fits
+    /// without wasting much of it.
+    fn acquire(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        max_size: u32,
+    ) -> LayerTexture {
+        let round = |size: u32| {
+            size.next_multiple_of(LAYER_TEXTURE_GRANULARITY)
+                .min(max_size)
+                .max(size)
+        };
+        let (rounded_width, rounded_height) = (round(width), round(height));
+        let area = |texture: &LayerTexture| texture.width as u64 * texture.height as u64;
+        // Fits, without more than twice the rounded size on either side.
+        let best = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, texture)| {
+                texture.width >= width
+                    && texture.height >= height
+                    && texture.width <= rounded_width * 2
+                    && texture.height <= rounded_height * 2
+            })
+            .min_by_key(|(_, texture)| area(texture))
+            .map(|(index, _)| index);
+        if let Some(index) = best {
+            return self.free.swap_remove(index);
+        }
+        let (width, height) = (rounded_width, rounded_height);
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("layer_texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("layer_depth_texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        LayerTexture {
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            _texture: texture,
+            depth_view: depth_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            _depth_texture: depth_texture,
+            width,
+            height,
+            last_used_frame: 0,
+        }
+    }
+
+    fn release(&mut self, mut texture: LayerTexture) {
+        texture.last_used_frame = self.frame;
+        self.free.push(texture);
+    }
+}
+
+/// The `LayerParams` uniform of `shaders.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LayerParams {
+    region: [f32; 4],
+    texture_size: [f32; 2],
+    opacity: f32,
+    brightness: f32,
+    matrix: [f32; 4],
+    translation: [f32; 2],
+    grayscale: f32,
+    mask_stop_count: u32,
+    clip: [f32; 4],
+    mask_gradient: [f32; 4],
+    mask_stops: [[f32; 4]; 4],
+    blur_direction: [f32; 2],
+    blur_sigma: f32,
+    pad: f32,
+    mask_texture_size: [f32; 2],
+    pad2: [f32; 2],
+}
+
+impl Default for LayerParams {
+    fn default() -> Self {
+        Self {
+            region: [0.0; 4],
+            texture_size: [1.0; 2],
+            opacity: 1.0,
+            brightness: 1.0,
+            matrix: [1.0, 0.0, 0.0, 1.0],
+            translation: [0.0; 2],
+            grayscale: 0.0,
+            mask_stop_count: 0,
+            clip: [0.0; 4],
+            mask_gradient: [0.0; 4],
+            mask_stops: [[0.0; 4]; 4],
+            blur_direction: [0.0; 2],
+            blur_sigma: 0.0,
+            pad: 0.0,
+            mask_texture_size: [1.0; 2],
+            pad2: [0.0; 2],
+        }
+    }
+}
+
+impl LayerParams {
+    fn for_composite(
+        composite: &LayerComposite,
+        layer: &OffscreenLayer,
+        texture: &LayerTexture,
+        mask: Option<&LayerTexture>,
+    ) -> Self {
+        let filter = &layer.filter;
+        let [[a, b], [c, d]] = composite.transformation.rotation_scale;
+        let mut mask_stops = [[0.0; 4]; 4];
+        for (index, stop) in filter.mask_stops.iter().enumerate() {
+            let pair = &mut mask_stops[index / 2];
+            pair[(index % 2) * 2] = stop[0];
+            pair[(index % 2) * 2 + 1] = stop[1];
+        }
+        let clip = composite.content_mask.bounds;
+        Self {
+            region: [
+                composite.bounds.origin.x.0,
+                composite.bounds.origin.y.0,
+                composite.bounds.size.width.0,
+                composite.bounds.size.height.0,
+            ],
+            texture_size: [texture.width as f32, texture.height as f32],
+            opacity: filter.opacity,
+            brightness: filter.brightness,
+            matrix: [a, b, c, d],
+            translation: composite.transformation.translation,
+            grayscale: filter.grayscale,
+            mask_stop_count: filter.mask_stop_count,
+            clip: [
+                clip.origin.x.0,
+                clip.origin.y.0,
+                clip.size.width.0,
+                clip.size.height.0,
+            ],
+            mask_gradient: [
+                filter.mask_gradient[0],
+                filter.mask_gradient[1],
+                filter.mask_gradient[2],
+                if mask.is_some() { 1.0 } else { 0.0 },
+            ],
+            mask_stops,
+            mask_texture_size: mask
+                .map_or([1.0; 2], |mask| [mask.width as f32, mask.height as f32]),
+            ..Self::default()
+        }
+    }
+}
+
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
@@ -2896,5 +3553,243 @@ mod tests {
                 33.0_f32.to_bits(),
             ]
         );
+    }
+}
+
+/// Offscreen layers (Astryx patch R3) drawn by the headless renderer and read
+/// back. Windows runs them on Direct3D 12 or Vulkan through wgpu.
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod layer_tests {
+    use super::*;
+    use gpui::{
+        BorderStyle, ContentMask, Corners, DevicePixels, Edges, Hsla, LayerFilter, LayerParams,
+        PlatformHeadlessRenderer, Point, Quad, Radians, Scene, Size, TransformationMatrix,
+    };
+
+    const SIZE: i32 = 32;
+
+    fn device_size() -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(SIZE),
+            height: DevicePixels(SIZE),
+        }
+    }
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: Size {
+                width: ScaledPixels(width),
+                height: ScaledPixels(height),
+            },
+        }
+    }
+
+    fn quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
+        let bounds = bounds(x, y, width, height);
+        Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: color.into(),
+            border_color: color,
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    fn params(filter: LayerFilter) -> LayerParams {
+        let window = bounds(0., 0., SIZE as f32, SIZE as f32);
+        let mut params = LayerParams::new(ContentMask { bounds: window }, window);
+        params.filter = filter;
+        params
+    }
+
+    fn render(scene: &mut Scene) -> image::RgbaImage {
+        scene.finish();
+        let mut renderer = match WgpuHeadlessRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => panic!("no headless GPU adapter: {error:#}"),
+        };
+        renderer
+            .render_scene_to_image(scene, device_size())
+            .expect("the scene renders")
+    }
+
+    #[track_caller]
+    fn assert_pixel(image: &image::RgbaImage, x: u32, y: u32, expected: [u8; 4]) {
+        let actual = image.get_pixel(x, y).0;
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 4),
+            "pixel ({x}, {y}) was {actual:?}, expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn a_layer_fades_as_one_group() {
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter {
+            opacity: 0.5,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(4., 4., 16., 16., gpui::red()));
+        // Drawn over the red one: in the group only blue shows there.
+        scene.insert_primitive(quad(12., 4., 16., 16., gpui::blue()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 8, 8, [128, 0, 0, 255]);
+        assert_pixel(&image, 16, 8, [0, 0, 128, 255]);
+        assert_pixel(&image, 24, 8, [0, 0, 128, 255]);
+        assert_pixel(&image, 2, 2, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_layer_rotates_its_content() {
+        let mut scene = Scene::default();
+        // A bar from (14, 4) to (18, 28), turned a quarter around the center.
+        let rotation = TransformationMatrix::unit()
+            .translate(Point::new(ScaledPixels(16.), ScaledPixels(16.)))
+            .rotate(Radians(std::f32::consts::FRAC_PI_2))
+            .translate(Point::new(ScaledPixels(-16.), ScaledPixels(-16.)));
+        let mut rotated = params(LayerFilter::default());
+        rotated.transformation = rotation;
+        scene.push_offscreen(rotated);
+        scene.insert_primitive(quad(14., 4., 4., 24., gpui::red()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 6, 16, [255, 0, 0, 255]);
+        assert_pixel(&image, 26, 16, [255, 0, 0, 255]);
+        assert_pixel(&image, 16, 6, [0, 0, 0, 255]);
+        assert_pixel(&image, 16, 26, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn filters_change_the_layers_colors() {
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter {
+            grayscale: 1.0,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(0., 0., 16., 32., gpui::red()));
+        scene.pop_offscreen();
+        scene.push_offscreen(params(LayerFilter {
+            brightness: 0.5,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(16., 0., 16., 32., gpui::blue()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        // CSS grayscale weighs red by 0.2126.
+        assert_pixel(&image, 8, 16, [54, 54, 54, 255]);
+        assert_pixel(&image, 24, 16, [0, 0, 128, 255]);
+    }
+
+    #[test]
+    fn a_gradient_mask_fades_the_layer() {
+        let mut filter = LayerFilter::default();
+        // Alpha from 0 at x = 0 to 1 at x = 32.
+        filter.mask_gradient = [1. / 32., 0., 0.];
+        filter.mask_stops[0] = [0., 0.];
+        filter.mask_stops[1] = [1., 1.];
+        filter.mask_stop_count = 2;
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(filter));
+        scene.insert_primitive(quad(0., 0., 32., 32., gpui::white()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        let at = |x: u32| image.get_pixel(x, 16).0[0] as f32 / 255.;
+        // Fragments are sampled at pixel centers.
+        assert!((at(8) - 8.5 / 32.).abs() < 0.03, "{}", at(8));
+        assert!((at(24) - 24.5 / 32.).abs() < 0.03, "{}", at(24));
+    }
+
+    #[test]
+    fn a_painted_mask_hides_what_it_leaves_out() {
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter::default()));
+        scene.insert_primitive(quad(0., 0., 32., 32., gpui::red()));
+        scene.push_offscreen_mask();
+        scene.insert_primitive(quad(0., 0., 16., 32., gpui::black()));
+        scene.pop_offscreen_mask();
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 8, 16, [255, 0, 0, 255]);
+        assert_pixel(&image, 24, 16, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_blur_spreads_the_layer() {
+        let mut scene = Scene::default();
+        scene.push_offscreen(params(LayerFilter {
+            blur: 2.0,
+            ..LayerFilter::default()
+        }));
+        scene.insert_primitive(quad(12., 12., 8., 8., gpui::white()));
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        let red = |x: u32, y: u32| image.get_pixel(x, y).0[0];
+        // Light reaches past the edge, and the center loses some.
+        assert!(red(10, 16) > 20, "{}", red(10, 16));
+        assert!(red(16, 16) < 250 && red(16, 16) > 150, "{}", red(16, 16));
+        assert!(red(2, 2) < 3, "{}", red(2, 2));
+        // Symmetric left and right.
+        assert!(red(10, 16).abs_diff(red(21, 16)) <= 4);
+    }
+
+    #[test]
+    fn nested_layers_multiply() {
+        let mut scene = Scene::default();
+        let half = LayerFilter {
+            opacity: 0.5,
+            ..LayerFilter::default()
+        };
+        scene.push_offscreen(params(half));
+        scene.push_offscreen(params(half));
+        scene.insert_primitive(quad(0., 0., 32., 32., gpui::white()));
+        scene.pop_offscreen();
+        scene.pop_offscreen();
+        let image = render(&mut scene);
+        assert_pixel(&image, 16, 16, [64, 64, 64, 255]);
+    }
+
+    #[test]
+    fn layers_are_drawn_in_paint_order() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 0., 32., 32., gpui::red()));
+        scene.push_offscreen(params(LayerFilter::default()));
+        scene.insert_primitive(quad(0., 0., 16., 32., gpui::blue()));
+        scene.pop_offscreen();
+        scene.insert_primitive(quad(8., 0., 4., 32., gpui::green()));
+        let image = render(&mut scene);
+        assert_pixel(&image, 4, 16, [0, 0, 255, 255]);
+        assert_pixel(&image, 10, 16, [0, 128, 0, 255]);
+        assert_pixel(&image, 24, 16, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn layer_textures_are_reused_across_frames() {
+        let mut renderer = WgpuHeadlessRenderer::new().expect("a headless GPU adapter");
+        for _ in 0..3 {
+            let mut scene = Scene::default();
+            scene.push_offscreen(params(LayerFilter {
+                blur: 1.0,
+                ..LayerFilter::default()
+            }));
+            scene.insert_primitive(quad(4., 4., 8., 8., gpui::white()));
+            scene.pop_offscreen();
+            scene.finish();
+            renderer
+                .render_scene_to_image(&scene, device_size())
+                .expect("the scene renders");
+        }
+        // The layer's texture and the blur's scratch one.
+        assert_eq!(renderer.core.layer_pool.free.len(), 2);
     }
 }

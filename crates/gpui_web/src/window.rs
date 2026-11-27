@@ -1150,6 +1150,11 @@ impl PlatformWindow for WebWindow {
             .supports_dual_source_blending()
     }
 
+    /// Offscreen layers are drawn by the wgpu renderer (Astryx patch R3).
+    fn supports_offscreen_layers(&self) -> bool {
+        true
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.inner.state.borrow().renderer.gpu_specs()
     }

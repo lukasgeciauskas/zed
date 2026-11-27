@@ -269,6 +269,10 @@ name = "astryx_transforms"
 path = "examples/astryx_transforms.rs"
 
 [[example]]
+name = "astryx_layers"
+path = "examples/astryx_layers.rs"
+
+[[example]]
 name = "astryx_inline"
 path = "examples/astryx_inline.rs"
 

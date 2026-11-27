@@ -5,13 +5,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, HitboxId, Hsla,
-    NativeViewId, Path, PathTiles, Pixels, Point, Radians, ScaledPixels, Size, TimedTransformation,
-    bounds_tree::BoundsTree,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges,
+    ElementId, HitboxId, Hsla, NativeViewId, Path, PathTiles, Pixels, Point, Radians, ScaledPixels,
+    Size, TimedTransformation, bounds_tree::BoundsTree,
 };
 use smallvec::SmallVec;
 use std::{
-    collections::VecDeque, fmt::Debug, iter::Peekable, ops::Range, rc::Rc, slice, time::Duration,
+    collections::VecDeque, fmt::Debug, iter::Peekable, mem, ops::Range, rc::Rc, slice,
+    time::Duration,
 };
 
 #[expect(missing_docs)]
@@ -38,6 +39,7 @@ impl PaddedBool32 {
     }
 }
 
+#[derive(Clone)]
 struct Layer {
     primitives: SmallVec<[Range<usize>; 1]>,
     bounds: Bounds<ScaledPixels>,
@@ -52,6 +54,16 @@ struct Layer {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
+    /// The offscreen layers composited into this scene, each drawn to its own
+    /// texture before this scene is drawn (Astryx patch R3). A layer's own
+    /// nested layers are in its content's list.
+    pub offscreen_layers: Vec<OffscreenLayer>,
+    /// The places [`Self::offscreen_layers`] are drawn at.
+    pub layer_composites: Vec<LayerComposite>,
+    /// Layers being painted, innermost last; primitives go to the last one.
+    offscreen_stack: Vec<OffscreenBuild>,
+    /// The union of what this scene draws, after clipping.
+    content_bounds: Option<Bounds<ScaledPixels>>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<usize>,
     layers: VecDeque<Layer>,
@@ -71,6 +83,10 @@ pub struct Scene {
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.offscreen_layers.clear();
+        self.layer_composites.clear();
+        self.offscreen_stack.clear();
+        self.content_bounds = None;
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.layers.clear();
@@ -93,6 +109,14 @@ impl Scene {
         mut sprite: MonochromeSprite,
         mut animation: SpriteAnimation,
     ) {
+        if let Some(build) = self.offscreen_stack.last_mut() {
+            // Animation ids index the scene a sprite is drawn in, so the
+            // sprite and its animation are kept together for replays.
+            build.scene.insert_animated_sprite(sprite, animation);
+            self.paint_operations
+                .push(PaintOperation::AnimatedSprite(sprite, animation));
+            return;
+        }
         sprite.animation = SpriteAnimationId(self.animations.len() as u32);
         animation.base_color = sprite.color;
         if self.try_insert_primitive(sprite.into()) {
@@ -104,7 +128,8 @@ impl Scene {
     /// its animations need a frame: `None` when nothing in it animates, and
     /// zero when an animation wants every frame.
     pub(crate) fn animation_frame_interval(&self) -> Option<Duration> {
-        self.animations
+        let own = self
+            .animations
             .iter()
             .map(|animation| {
                 animation
@@ -112,12 +137,39 @@ impl Scene {
                     .min_frame_interval()
                     .unwrap_or_default()
             })
-            .min()
+            .min();
+        self.offscreen_layers
+            .iter()
+            .flat_map(|layer| {
+                [
+                    layer.content.animation_frame_interval(),
+                    layer
+                        .mask
+                        .as_ref()
+                        .and_then(|mask| mask.animation_frame_interval()),
+                ]
+            })
+            .fold(own, |min, interval| match (min, interval) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            })
     }
 
     /// Moves every animated sprite to its pose at `elapsed` time on the app's
     /// synced animation clock, without the scene being rebuilt.
     pub(crate) fn advance_animations(&mut self, elapsed: Duration) {
+        // Layer contents animate too. A content shared with a retained
+        // snapshot is copied first, so the snapshot keeps its look.
+        for layer in &mut self.offscreen_layers {
+            if layer.content.animation_frame_interval().is_some() {
+                Rc::make_mut(&mut layer.content).advance_animations(elapsed);
+            }
+            if let Some(mask) = layer.mask.as_mut()
+                && mask.animation_frame_interval().is_some()
+            {
+                Rc::make_mut(mask).advance_animations(elapsed);
+            }
+        }
         for animation in &self.animations {
             let Some(sprite) = self.monochrome_sprites.get_mut(animation.sprite_index) else {
                 continue;
@@ -136,6 +188,11 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self) {
+        if let Some(build) = self.offscreen_stack.last_mut() {
+            build.scene.push_layer();
+            self.paint_operations.push(PaintOperation::StartLayer);
+            return;
+        }
         self.layer_stack.push(self.layers.len());
         self.layers.push_back(Layer {
             primitives: SmallVec::new(),
@@ -148,6 +205,11 @@ impl Scene {
     }
 
     pub fn pop_layer(&mut self) {
+        if let Some(build) = self.offscreen_stack.last_mut() {
+            build.scene.pop_layer();
+            self.paint_operations.push(PaintOperation::EndLayer);
+            return;
+        }
         self.layer_stack.pop();
         if self.layer_stack.is_empty() {
             while let Some(layer) = self.layers.pop_front() {
@@ -226,10 +288,24 @@ impl Scene {
 
     /// Returns whether the primitive was kept, rather than clipped away.
     fn try_insert_primitive(&mut self, primitive: Primitive) -> bool {
+        if let Some(build) = self.offscreen_stack.last_mut() {
+            // Painted into the layer being built; recorded here as well, so
+            // that a cached view replays it from this scene's operations.
+            let kept = build.scene.try_insert_primitive(primitive.clone());
+            if kept {
+                self.paint_operations
+                    .push(PaintOperation::Primitive(primitive));
+            }
+            return kept;
+        }
         let clipped_bounds = primitive.clipped_bounds();
         if clipped_bounds.is_empty() {
             return false;
         }
+        self.content_bounds = Some(match self.content_bounds {
+            Some(bounds) => bounds.union(&clipped_bounds),
+            None => clipped_bounds,
+        });
 
         let kind = primitive.kind();
         if let Some(&layer) = self.layer_stack.last()
@@ -283,12 +359,34 @@ impl Scene {
                 order,
                 ..native_view
             }),
+            Primitive::Layer(composite) => self
+                .layer_composites
+                .push(LayerComposite { order, ..composite }),
         }
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        // Animation ids of sprites painted into a layer index that layer's
+        // content, so they are only looked up here outside layers.
         for operation in &prev_scene.paint_operations[range] {
             match operation {
+                // The layer's end, or its snapshot, inserts it again.
+                PaintOperation::Primitive(Primitive::Layer(_)) => {}
+                PaintOperation::AnimatedSprite(sprite, animation) => {
+                    self.insert_animated_sprite(*sprite, *animation);
+                }
+                PaintOperation::StartOffscreen(params) => self.push_offscreen((**params).clone()),
+                PaintOperation::EndOffscreen => self.pop_offscreen(),
+                PaintOperation::StartLayerMask => self.push_offscreen_mask(),
+                PaintOperation::EndLayerMask => self.pop_offscreen_mask(),
+                PaintOperation::LayerSnapshot(snapshot) => {
+                    let LayerSnapshotOperation {
+                        content,
+                        mask,
+                        params,
+                    } = &**snapshot;
+                    self.insert_layer_snapshot(content.clone(), mask.clone(), params.clone());
+                }
                 PaintOperation::Primitive(primitive) => {
                     // Animation ids index the scene they were inserted into.
                     if let Primitive::MonochromeSprite(sprite) = primitive
@@ -308,6 +406,14 @@ impl Scene {
 
     pub fn finish(&mut self) {
         debug_assert!(self.layer_stack.is_empty(), "unbalanced scene layers");
+        debug_assert!(
+            self.offscreen_stack.is_empty(),
+            "unbalanced offscreen layers"
+        );
+        // An unbalanced layer (a panic while painting one) is dropped.
+        self.offscreen_stack.clear();
+        self.layer_composites
+            .sort_by_key(|composite| composite.order);
         let keys = &mut Vec::new();
         sort_in_place(&mut self.shadows, keys, |shadow| (shadow.order, 0));
         sort_in_place(&mut self.quads, keys, |quad| (quad.order, 0));
@@ -373,7 +479,26 @@ impl Scene {
         allow(dead_code)
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
+        // Renderers without offscreen layers never get a scene with any.
+        self.batches_with_layers().filter_map(|batch| match batch {
+            SceneBatch::Primitives(batch) => Some(batch),
+            SceneBatch::Layers(_) => None,
+        })
+    }
+
+    /// The batches of [`Self::batches`] with the composites of offscreen
+    /// layers in their place in the drawing order (Astryx patch R3).
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(any(feature = "x11", feature = "wayland"))
+        ),
+        allow(dead_code)
+    )]
+    pub fn batches_with_layers(&self) -> impl Iterator<Item = SceneBatch> + '_ {
         BatchIterator {
+            layers_start: 0,
+            layers_iter: self.layer_composites.iter().peekable(),
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
@@ -392,6 +517,420 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             native_views_start: 0,
             native_views_iter: self.native_views.iter().peekable(),
+        }
+    }
+}
+
+/// The most stops a layer's gradient mask has (Astryx patch R3).
+pub const MAX_LAYER_MASK_STOPS: usize = 8;
+
+/// The filters and mask an offscreen layer is composited with, resolved to
+/// device pixels (Astryx patch R3). Renderers apply them in the order CSS
+/// does: blur, brightness, grayscale, then the mask and opacity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerFilter {
+    /// Multiplies the layer's alpha, as CSS `opacity` does for a group.
+    pub opacity: f32,
+    /// The standard deviation of a Gaussian blur in device pixels, as CSS
+    /// `filter: blur()`. Zero for none.
+    pub blur: f32,
+    /// CSS `filter: brightness()`: multiplies each color channel.
+    pub brightness: f32,
+    /// CSS `filter: grayscale()`, from 0 (none) to 1.
+    pub grayscale: f32,
+    /// The gradient mask's parameter at a device-pixel position `p` of the
+    /// layer's content: `p.x * g[0] + p.y * g[1] + g[2]`.
+    pub mask_gradient: [f32; 3],
+    /// The gradient mask's stops as `(parameter, alpha)`, in order. The alpha
+    /// is constant before the first stop and after the last.
+    pub mask_stops: [[f32; 2]; MAX_LAYER_MASK_STOPS],
+    /// How many of `mask_stops` are used; zero for no gradient mask.
+    pub mask_stop_count: u32,
+}
+
+impl Default for LayerFilter {
+    fn default() -> Self {
+        Self {
+            opacity: 1.0,
+            blur: 0.0,
+            brightness: 1.0,
+            grayscale: 0.0,
+            mask_gradient: [0.0; 3],
+            mask_stops: [[0.0; 2]; MAX_LAYER_MASK_STOPS],
+            mask_stop_count: 0,
+        }
+    }
+}
+
+impl LayerFilter {
+    /// The gradient mask's alpha at a device-pixel position of the layer's
+    /// content, as the renderers' shaders compute it.
+    pub fn mask_alpha(&self, position: Point<f32>) -> f32 {
+        let count = (self.mask_stop_count as usize).min(MAX_LAYER_MASK_STOPS);
+        if count == 0 {
+            return 1.0;
+        }
+        let [gx, gy, g0] = self.mask_gradient;
+        let t = position.x * gx + position.y * gy + g0;
+        let stops = &self.mask_stops[..count];
+        if t <= stops[0][0] {
+            return stops[0][1];
+        }
+        for pair in stops.windows(2) {
+            let ([t0, a0], [t1, a1]) = (pair[0], pair[1]);
+            if t <= t1 {
+                let span = t1 - t0;
+                if span <= f32::EPSILON {
+                    return a1;
+                }
+                return a0 + (a1 - a0) * (t - t0) / span;
+            }
+        }
+        stops[count - 1][1]
+    }
+
+    /// Whether compositing with this filter leaves the layer's pixels as they are.
+    pub fn is_identity(&self) -> bool {
+        self.opacity == 1.0
+            && self.blur == 0.0
+            && self.brightness == 1.0
+            && self.grayscale == 0.0
+            && self.mask_stop_count == 0
+    }
+}
+
+/// Names a layer whose content the window keeps after the frame, so that it
+/// can be drawn again later as a snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LayerKey {
+    pub(crate) id: ElementId,
+    /// A layer painted live that replaces the kept content, rather than a
+    /// snapshot that only keeps it alive.
+    pub(crate) retain: bool,
+    /// The bounds of the element the layer was painted for, in the device
+    /// pixels of its content.
+    pub(crate) element_bounds: Bounds<ScaledPixels>,
+}
+
+/// How an offscreen layer is composited into the scene it is painted in
+/// (Astryx patch R3).
+#[derive(Clone, Debug)]
+pub struct LayerParams {
+    /// Maps the layer's content, in device pixels, to where it is drawn.
+    pub transformation: TransformationMatrix,
+    /// The clip the composite is drawn with, in the device pixels it is
+    /// drawn in.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The largest area the layer's texture covers, usually the viewport.
+    pub max_region: Bounds<ScaledPixels>,
+    /// The filters and mask.
+    pub filter: LayerFilter,
+    pub(crate) key: Option<LayerKey>,
+}
+
+impl LayerParams {
+    /// A layer composited as it is, clipped to `content_mask`, its texture
+    /// at most `max_region`.
+    pub fn new(content_mask: ContentMask<ScaledPixels>, max_region: Bounds<ScaledPixels>) -> Self {
+        Self {
+            transformation: TransformationMatrix::unit(),
+            content_mask,
+            max_region,
+            filter: LayerFilter::default(),
+            key: None,
+        }
+    }
+}
+
+/// A subtree drawn to its own texture before the scene that composites it
+/// (Astryx patch R3).
+#[derive(Clone, Debug)]
+pub struct OffscreenLayer {
+    /// What is drawn into the texture, finished. Its own offscreen layers are
+    /// drawn before it.
+    pub content: Rc<Scene>,
+    /// An alpha mask painted for the layer, drawn into a texture covering
+    /// the same region; its alpha multiplies the layer's.
+    pub mask: Option<Rc<Scene>>,
+    /// The area of the content's device-pixel space the texture covers. It
+    /// leaves a transparent border, and room for the blur.
+    pub region: Bounds<DevicePixels>,
+    /// The filters and mask the texture is composited with.
+    pub filter: LayerFilter,
+    pub(crate) key: Option<LayerKey>,
+}
+
+/// Where an offscreen layer is drawn: its texture's region, mapped by
+/// `transformation` (Astryx patch R3).
+#[derive(Clone, Copy, Debug)]
+pub struct LayerComposite {
+    #[expect(missing_docs)]
+    pub order: DrawOrder,
+    /// The layer's index in the scene's [`Scene::offscreen_layers`].
+    pub layer: u32,
+    /// The texture's region, before the transformation.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The clip, after the transformation.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Maps the region to where it is drawn.
+    pub transformation: TransformationMatrix,
+}
+
+impl From<LayerComposite> for Primitive {
+    fn from(composite: LayerComposite) -> Self {
+        Primitive::Layer(composite)
+    }
+}
+
+/// A layer being painted.
+struct OffscreenBuild {
+    /// Where primitives go: the content, or the mask while one is painted.
+    scene: Scene,
+    /// The content while its mask is painted.
+    held_content: Option<Scene>,
+    mask: Option<Scene>,
+    params: LayerParams,
+}
+
+/// The transparent border a layer's texture keeps around its content, so a
+/// rotated or scaled composite samples soft edges.
+const LAYER_BORDER: f32 = 2.0;
+
+/// The integer device-pixel area a layer's texture covers.
+fn layer_region(
+    content_bounds: Bounds<ScaledPixels>,
+    blur: f32,
+    max_region: Bounds<ScaledPixels>,
+) -> Option<Bounds<DevicePixels>> {
+    let padding = (blur.max(0.0) * 3.0).ceil() + LAYER_BORDER;
+    let bounds = content_bounds
+        .dilate(ScaledPixels(padding))
+        .intersect(&max_region);
+    let left = bounds.origin.x.0.floor();
+    let top = bounds.origin.y.0.floor();
+    let right = (bounds.origin.x.0 + bounds.size.width.0).ceil();
+    let bottom = (bounds.origin.y.0 + bounds.size.height.0).ceil();
+    if !(right > left && bottom > top) {
+        return None;
+    }
+    Some(Bounds {
+        origin: Point::new(DevicePixels(left as i32), DevicePixels(top as i32)),
+        size: Size {
+            width: DevicePixels((right - left) as i32),
+            height: DevicePixels((bottom - top) as i32),
+        },
+    })
+}
+
+impl Debug for Scene {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scene")
+            .field("content_bounds", &self.content_bounds)
+            .field("quads", &self.quads.len())
+            .field("shadows", &self.shadows.len())
+            .field("paths", &self.paths.len())
+            .field(
+                "sprites",
+                &(self.monochrome_sprites.len() + self.polychrome_sprites.len()),
+            )
+            .field("offscreen_layers", &self.offscreen_layers)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for Scene {
+    /// Copies what a finished scene draws. The bookkeeping only needed
+    /// while it is painted (its paint operations and draw orders) stays
+    /// behind, so the copy can be drawn but not painted into or replayed.
+    fn clone(&self) -> Self {
+        Self {
+            paint_operations: Vec::new(),
+            offscreen_layers: self.offscreen_layers.clone(),
+            layer_composites: self.layer_composites.clone(),
+            offscreen_stack: Vec::new(),
+            content_bounds: self.content_bounds,
+            primitive_bounds: BoundsTree::default(),
+            layer_stack: Vec::new(),
+            layers: VecDeque::new(),
+            shadows: self.shadows.clone(),
+            quads: self.quads.clone(),
+            paths: self.paths.clone(),
+            underlines: self.underlines.clone(),
+            monochrome_sprites: self.monochrome_sprites.clone(),
+            subpixel_sprites: self.subpixel_sprites.clone(),
+            polychrome_sprites: self.polychrome_sprites.clone(),
+            surfaces: self.surfaces.clone(),
+            native_views: self.native_views.clone(),
+            animations: self.animations.clone(),
+        }
+    }
+}
+
+/// Offscreen layers (Astryx patch R3).
+impl Scene {
+    /// The union of what this scene draws, after clipping, in device pixels.
+    pub fn content_bounds(&self) -> Option<Bounds<ScaledPixels>> {
+        self.content_bounds
+    }
+
+    /// Whether an offscreen layer is being painted.
+    pub fn in_offscreen_layer(&self) -> bool {
+        !self.offscreen_stack.is_empty()
+    }
+
+    /// The scene primitives go to: the innermost layer being painted.
+    fn target(&mut self) -> &mut Scene {
+        if self.offscreen_stack.is_empty() {
+            self
+        } else {
+            let build = self.offscreen_stack.last_mut().expect("a layer is painted");
+            &mut build.scene
+        }
+    }
+
+    /// Starts an offscreen layer: until the matching [`Self::pop_offscreen`],
+    /// what is inserted is drawn into the layer's texture, which is then
+    /// composited with `params` where the layer was started.
+    pub fn push_offscreen(&mut self, params: LayerParams) {
+        self.paint_operations
+            .push(PaintOperation::StartOffscreen(Box::new(params.clone())));
+        self.offscreen_stack.push(OffscreenBuild {
+            scene: Scene::default(),
+            held_content: None,
+            mask: None,
+            params,
+        });
+    }
+
+    /// Ends the innermost offscreen layer and composites it.
+    pub fn pop_offscreen(&mut self) {
+        self.paint_operations.push(PaintOperation::EndOffscreen);
+        let Some(mut build) = self.offscreen_stack.pop() else {
+            debug_assert!(false, "no offscreen layer to end");
+            return;
+        };
+        if let Some(content) = build.held_content.take() {
+            build.mask = Some(mem::replace(&mut build.scene, content));
+        }
+        build.scene.finish();
+        let mask = build.mask.map(|mut mask| {
+            mask.finish();
+            Rc::new(mask)
+        });
+        self.target()
+            .insert_offscreen_layer(Rc::new(build.scene), mask, build.params);
+    }
+
+    /// Starts painting the innermost layer's mask: until
+    /// [`Self::pop_offscreen_mask`], what is inserted goes to the mask, whose
+    /// alpha multiplies the layer's.
+    pub fn push_offscreen_mask(&mut self) {
+        self.paint_operations.push(PaintOperation::StartLayerMask);
+        let Some(build) = self.offscreen_stack.last_mut() else {
+            debug_assert!(false, "a mask is painted for a layer");
+            return;
+        };
+        if build.held_content.is_none() {
+            build.held_content = Some(mem::take(&mut build.scene));
+        }
+    }
+
+    /// Ends the innermost layer's mask.
+    pub fn pop_offscreen_mask(&mut self) {
+        self.paint_operations.push(PaintOperation::EndLayerMask);
+        let Some(build) = self.offscreen_stack.last_mut() else {
+            return;
+        };
+        if let Some(content) = build.held_content.take() {
+            let mask = mem::replace(&mut build.scene, content);
+            build.mask = Some(match build.mask.take() {
+                // A second mask paints over the first.
+                Some(mut previous) => {
+                    previous.replay_finished(&mask);
+                    previous
+                }
+                None => mask,
+            });
+        }
+    }
+
+    /// Composites a finished layer content again, such as a snapshot kept
+    /// from an earlier frame.
+    pub fn insert_layer_snapshot(
+        &mut self,
+        content: Rc<Scene>,
+        mask: Option<Rc<Scene>>,
+        params: LayerParams,
+    ) {
+        self.paint_operations
+            .push(PaintOperation::LayerSnapshot(Box::new(
+                LayerSnapshotOperation {
+                    content: content.clone(),
+                    mask: mask.clone(),
+                    params: params.clone(),
+                },
+            )));
+        self.target().insert_offscreen_layer(content, mask, params);
+    }
+
+    /// Re-inserts what an unfinished scene recorded.
+    fn replay_finished(&mut self, other: &Scene) {
+        let range = 0..other.paint_operations.len();
+        self.replay(range, other);
+    }
+
+    fn insert_offscreen_layer(
+        &mut self,
+        content: Rc<Scene>,
+        mask: Option<Rc<Scene>>,
+        params: LayerParams,
+    ) {
+        let Some(content_bounds) = content.content_bounds else {
+            return;
+        };
+        let Some(region) = layer_region(content_bounds, params.filter.blur, params.max_region)
+        else {
+            return;
+        };
+        let composite = LayerComposite {
+            order: 0,
+            layer: self.offscreen_layers.len() as u32,
+            bounds: Bounds {
+                origin: Point::new(
+                    ScaledPixels(region.origin.x.0 as f32),
+                    ScaledPixels(region.origin.y.0 as f32),
+                ),
+                size: Size {
+                    width: ScaledPixels(region.size.width.0 as f32),
+                    height: ScaledPixels(region.size.height.0 as f32),
+                },
+            },
+            content_mask: params.content_mask,
+            transformation: params.transformation,
+        };
+        self.offscreen_layers.push(OffscreenLayer {
+            content,
+            mask,
+            region,
+            filter: params.filter,
+            key: params.key,
+        });
+        if !self.try_insert_primitive(Primitive::Layer(composite)) {
+            self.offscreen_layers.pop();
+        }
+    }
+
+    /// Calls `f` for every layer drawn in this scene that has a key, inner
+    /// layers included.
+    pub(crate) fn for_each_keyed_layer(&self, f: &mut impl FnMut(&OffscreenLayer)) {
+        for layer in &self.offscreen_layers {
+            if layer.key.is_some() {
+                f(layer);
+            }
+            layer.content.for_each_keyed_layer(f);
+            if let Some(mask) = &layer.mask {
+                mask.for_each_keyed_layer(f);
+            }
         }
     }
 }
@@ -464,6 +1003,8 @@ pub(crate) enum PrimitiveKind {
     MonochromeSprite,
     SubpixelSprite,
     PolychromeSprite,
+    /// The composite of an offscreen layer (Astryx patch R3).
+    Layer,
     Surface,
     NativeView,
 }
@@ -480,6 +1021,7 @@ impl PrimitiveKind {
             Self::MonochromeSprite => Self::Underline,
             Self::SubpixelSprite => Self::MonochromeSprite,
             Self::PolychromeSprite => Self::SubpixelSprite,
+            Self::Layer => Self::PolychromeSprite,
             kind => kind,
         }
     }
@@ -489,6 +1031,19 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer,
     EndLayer,
+    /// A sprite animated by the window, painted into an offscreen layer.
+    AnimatedSprite(MonochromeSprite, SpriteAnimation),
+    StartOffscreen(Box<LayerParams>),
+    EndOffscreen,
+    StartLayerMask,
+    EndLayerMask,
+    LayerSnapshot(Box<LayerSnapshotOperation>),
+}
+
+pub(crate) struct LayerSnapshotOperation {
+    content: Rc<Scene>,
+    mask: Option<Rc<Scene>>,
+    params: LayerParams,
 }
 
 #[derive(Clone)]
@@ -503,6 +1058,7 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     NativeView(PaintNativeView),
+    Layer(LayerComposite),
 }
 
 #[expect(missing_docs)]
@@ -518,6 +1074,7 @@ impl Primitive {
             Primitive::PolychromeSprite(_) => PrimitiveKind::PolychromeSprite,
             Primitive::Surface(_) => PrimitiveKind::Surface,
             Primitive::NativeView(_) => PrimitiveKind::NativeView,
+            Primitive::Layer(_) => PrimitiveKind::Layer,
         }
     }
 
@@ -532,6 +1089,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::NativeView(native_view) => &native_view.bounds,
+            Primitive::Layer(composite) => &composite.bounds,
         }
     }
 
@@ -539,6 +1097,7 @@ impl Primitive {
         match self {
             Primitive::MonochromeSprite(sprite) => sprite.transformation,
             Primitive::SubpixelSprite(sprite) => sprite.transformation,
+            Primitive::Layer(composite) => composite.transformation,
             _ => TransformationMatrix::unit(),
         }
     }
@@ -560,6 +1119,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::NativeView(native_view) => &native_view.content_mask,
+            Primitive::Layer(composite) => &composite.content_mask,
         }
     }
 }
@@ -590,10 +1150,12 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     native_views_start: usize,
     native_views_iter: Peekable<slice::Iter<'a, PaintNativeView>>,
+    layers_start: usize,
+    layers_iter: Peekable<slice::Iter<'a, LayerComposite>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
-    type Item = PrimitiveBatch;
+    type Item = SceneBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
@@ -632,6 +1194,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .map(|native_view| native_view.order),
                 PrimitiveKind::NativeView,
             ),
+            (
+                self.layers_iter.peek().map(|layer| layer.order),
+                PrimitiveKind::Layer,
+            ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
@@ -656,7 +1222,9 @@ impl<'a> Iterator for BatchIterator<'a> {
                     shadows_end += 1;
                 }
                 self.shadows_start = shadows_end;
-                Some(PrimitiveBatch::Shadows(shadows_start..shadows_end))
+                Some(SceneBatch::Primitives(PrimitiveBatch::Shadows(
+                    shadows_start..shadows_end,
+                )))
             }
             PrimitiveKind::Quad => {
                 let quads_start = self.quads_start;
@@ -670,7 +1238,9 @@ impl<'a> Iterator for BatchIterator<'a> {
                     quads_end += 1;
                 }
                 self.quads_start = quads_end;
-                Some(PrimitiveBatch::Quads(quads_start..quads_end))
+                Some(SceneBatch::Primitives(PrimitiveBatch::Quads(
+                    quads_start..quads_end,
+                )))
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -684,7 +1254,9 @@ impl<'a> Iterator for BatchIterator<'a> {
                     paths_end += 1;
                 }
                 self.paths_start = paths_end;
-                Some(PrimitiveBatch::Paths(paths_start..paths_end))
+                Some(SceneBatch::Primitives(PrimitiveBatch::Paths(
+                    paths_start..paths_end,
+                )))
             }
             PrimitiveKind::Underline => {
                 let underlines_start = self.underlines_start;
@@ -698,7 +1270,9 @@ impl<'a> Iterator for BatchIterator<'a> {
                     underlines_end += 1;
                 }
                 self.underlines_start = underlines_end;
-                Some(PrimitiveBatch::Underlines(underlines_start..underlines_end))
+                Some(SceneBatch::Primitives(PrimitiveBatch::Underlines(
+                    underlines_start..underlines_end,
+                )))
             }
             PrimitiveKind::MonochromeSprite => {
                 let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
@@ -716,10 +1290,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     sprites_end += 1;
                 }
                 self.monochrome_sprites_start = sprites_end;
-                Some(PrimitiveBatch::MonochromeSprites {
+                Some(SceneBatch::Primitives(PrimitiveBatch::MonochromeSprites {
                     texture_id,
                     range: sprites_start..sprites_end,
-                })
+                }))
             }
             PrimitiveKind::SubpixelSprite => {
                 let texture_id = self.subpixel_sprites_iter.peek().unwrap().tile.texture_id;
@@ -737,10 +1311,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     sprites_end += 1;
                 }
                 self.subpixel_sprites_start = sprites_end;
-                Some(PrimitiveBatch::SubpixelSprites {
+                Some(SceneBatch::Primitives(PrimitiveBatch::SubpixelSprites {
                     texture_id,
                     range: sprites_start..sprites_end,
-                })
+                }))
             }
             PrimitiveKind::PolychromeSprite => {
                 let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
@@ -758,10 +1332,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     sprites_end += 1;
                 }
                 self.polychrome_sprites_start = sprites_end;
-                Some(PrimitiveBatch::PolychromeSprites {
+                Some(SceneBatch::Primitives(PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     range: sprites_start..sprites_end,
-                })
+                }))
             }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
@@ -775,7 +1349,9 @@ impl<'a> Iterator for BatchIterator<'a> {
                     surfaces_end += 1;
                 }
                 self.surfaces_start = surfaces_end;
-                Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
+                Some(SceneBatch::Primitives(PrimitiveBatch::Surfaces(
+                    surfaces_start..surfaces_end,
+                )))
             }
             PrimitiveKind::NativeView => {
                 let native_views_start = self.native_views_start;
@@ -789,9 +1365,23 @@ impl<'a> Iterator for BatchIterator<'a> {
                     native_views_end += 1;
                 }
                 self.native_views_start = native_views_end;
-                Some(PrimitiveBatch::NativeViews(
+                Some(SceneBatch::Primitives(PrimitiveBatch::NativeViews(
                     native_views_start..native_views_end,
-                ))
+                )))
+            }
+            PrimitiveKind::Layer => {
+                let layers_start = self.layers_start;
+                let mut layers_end = layers_start + 1;
+                self.layers_iter.next();
+                while self
+                    .layers_iter
+                    .next_if(|layer| (layer.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    layers_end += 1;
+                }
+                self.layers_start = layers_end;
+                Some(SceneBatch::Layers(layers_start..layers_end))
             }
         }
     }
@@ -826,6 +1416,32 @@ pub enum PrimitiveBatch {
     },
     Surfaces(Range<usize>),
     NativeViews(Range<usize>),
+}
+
+/// A batch of [`Scene::batches_with_layers`] (Astryx patch R3).
+#[derive(Debug)]
+#[cfg_attr(
+    all(
+        any(target_os = "linux", target_os = "freebsd"),
+        not(any(feature = "x11", feature = "wayland"))
+    ),
+    allow(dead_code)
+)]
+pub enum SceneBatch {
+    /// Primitives, drawn as before.
+    Primitives(PrimitiveBatch),
+    /// Composites of offscreen layers: a range of [`Scene::layer_composites`].
+    Layers(Range<usize>),
+}
+
+impl SceneBatch {
+    /// A label for debugging and GPU annotations.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Primitives(batch) => batch.label(),
+            Self::Layers(range) => format!("offscreen layers ({})", range.len()),
+        }
+    }
 }
 
 impl PrimitiveBatch {
@@ -1483,5 +2099,129 @@ mod tests {
         scene.insert_primitive(quad(5.));
         scene.pop_layer();
         assert_eq!(batch_labels(&mut scene), ["underlines (1)", "quads (1)"]);
+    }
+    fn layer(scene: &mut Scene, blur: f32, paint: impl FnOnce(&mut Scene)) {
+        let window = Bounds {
+            origin: point(ScaledPixels(-100.), ScaledPixels(-100.)),
+            size: size(ScaledPixels(1000.), ScaledPixels(1000.)),
+        };
+        let mut params = LayerParams::new(ContentMask { bounds: window }, window);
+        params.filter.blur = blur;
+        scene.push_offscreen(params);
+        paint(scene);
+        scene.pop_offscreen();
+    }
+
+    fn batch_labels_with_layers(scene: &mut Scene) -> Vec<String> {
+        scene.finish();
+        scene
+            .batches_with_layers()
+            .map(|batch| batch.label())
+            .collect()
+    }
+
+    #[test]
+    fn layers_take_their_place_in_the_drawing_order() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0.));
+        layer(&mut scene, 0., |scene| scene.insert_primitive(quad(5.)));
+        scene.insert_primitive(quad(8.));
+        assert_eq!(
+            batch_labels_with_layers(&mut scene),
+            ["quads (1)", "offscreen layers (1)", "quads (1)"]
+        );
+        // Renderers without layers never see them.
+        assert_eq!(batch_labels(&mut scene), ["quads (1)", "quads (1)"]);
+        assert_eq!(scene.offscreen_layers[0].content.quads.len(), 1);
+    }
+
+    #[test]
+    fn a_layer_inside_a_layer_belongs_to_its_content() {
+        let mut scene = Scene::default();
+        layer(&mut scene, 0., |scene| {
+            scene.insert_primitive(quad(0.));
+            layer(scene, 0., |scene| scene.insert_primitive(quad(5.)));
+            assert!(scene.in_offscreen_layer());
+        });
+        scene.finish();
+        assert!(!scene.in_offscreen_layer());
+        assert_eq!(scene.offscreen_layers.len(), 1);
+        let outer = &scene.offscreen_layers[0].content;
+        assert_eq!(outer.quads.len(), 1);
+        assert_eq!(outer.offscreen_layers.len(), 1);
+        assert_eq!(outer.layer_composites.len(), 1);
+        assert_eq!(outer.offscreen_layers[0].content.quads.len(), 1);
+    }
+
+    #[test]
+    fn a_replayed_layer_is_built_again() {
+        let mut previous = Scene::default();
+        layer(&mut previous, 0., |scene| {
+            scene.push_layer();
+            scene.insert_primitive(quad(0.));
+            scene.pop_layer();
+            scene.insert_primitive(underline(0.));
+        });
+        previous.finish();
+        let mut scene = Scene::default();
+        scene.replay(0..previous.len(), &previous);
+        scene.finish();
+        assert_eq!(scene.offscreen_layers.len(), 1);
+        assert_eq!(scene.layer_composites.len(), 1);
+        let content = &scene.offscreen_layers[0].content;
+        assert_eq!(content.quads.len(), 1);
+        assert_eq!(content.underlines.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_or_clipped_layer_is_left_out() {
+        let mut scene = Scene::default();
+        layer(&mut scene, 0., |_| {});
+        // Composited where its clip leaves nothing.
+        let clipped = LayerParams::new(
+            ContentMask {
+                bounds: square(50.),
+            },
+            square(0.),
+        );
+        scene.push_offscreen(clipped);
+        scene.insert_primitive(quad(0.));
+        scene.pop_offscreen();
+        scene.finish();
+        assert!(scene.offscreen_layers.is_empty());
+        assert!(scene.layer_composites.is_empty());
+    }
+
+    #[test]
+    fn a_layers_region_leaves_room_for_its_blur() {
+        let mut scene = Scene::default();
+        layer(&mut scene, 2., |scene| scene.insert_primitive(quad(20.)));
+        scene.finish();
+        let region = scene.offscreen_layers[0].region;
+        // Three deviations of blur and a two-pixel border on each side.
+        assert_eq!(region.origin.x.0, 20 - 8);
+        assert_eq!(region.origin.y.0, -8);
+        assert_eq!(region.size.width.0, 10 + 16);
+    }
+
+    #[test]
+    fn a_layer_can_be_composited_again_from_its_content() {
+        let mut scene = Scene::default();
+        layer(&mut scene, 0., |scene| scene.insert_primitive(quad(0.)));
+        scene.finish();
+        let content = scene.offscreen_layers[0].content.clone();
+        let mut later = Scene::default();
+        let window = square(0.).dilate(ScaledPixels(100.));
+        let mut params = LayerParams::new(ContentMask { bounds: window }, window);
+        params.transformation =
+            TransformationMatrix::unit().translate(point(ScaledPixels(30.), ScaledPixels(0.)));
+        later.insert_layer_snapshot(content.clone(), None, params);
+        later.finish();
+        assert!(Rc::ptr_eq(&later.offscreen_layers[0].content, &content));
+        let composite = later.layer_composites[0];
+        assert_eq!(
+            Primitive::Layer(composite).clipped_bounds().origin.x,
+            ScaledPixels(28.)
+        );
     }
 }

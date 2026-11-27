@@ -1681,6 +1681,11 @@ impl PlatformWindow for X11Window {
             .unwrap_or_default()
     }
 
+    /// Offscreen layers are drawn by the wgpu renderer (Astryx patch R3).
+    fn supports_offscreen_layers(&self) -> bool {
+        true
+    }
+
     fn minimize(&self) {
         let state = self.0.state.borrow();
         const WINDOW_ICONIC_STATE: u32 = 3;

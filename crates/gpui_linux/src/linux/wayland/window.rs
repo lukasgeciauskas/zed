@@ -1964,6 +1964,11 @@ impl PlatformWindow for WaylandWindow {
             .is_some_and(|ctx| ctx.supports_dual_source_blending())
     }
 
+    /// Offscreen layers are drawn by the wgpu renderer (Astryx patch R3).
+    fn supports_offscreen_layers(&self) -> bool {
+        true
+    }
+
     fn minimize(&self) {
         if let Some(toplevel) = self.borrow().surface_state.toplevel() {
             toplevel.set_minimized();

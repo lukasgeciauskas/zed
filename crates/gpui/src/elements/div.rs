@@ -823,6 +823,16 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Keeps this element's look after each frame under `id` (Astryx patch
+    /// R3): the element is drawn to an offscreen layer that the window keeps,
+    /// so [`crate::layer_snapshot`] or [`Window::paint_layer_snapshot`] can
+    /// draw it again later, even after the element is gone. Ids are shared by
+    /// the whole window. Renderers without offscreen layers keep nothing.
+    fn retain_layer(mut self, id: impl Into<ElementId>) -> Self {
+        self.interactivity().retain_layer = Some(id.into());
+        self
+    }
+
     /// Set whether this element is a tab stop.
     ///
     /// When false, the element remains in tab-index order but cannot be reached via keyboard navigation.
@@ -2534,6 +2544,8 @@ pub struct Interactivity {
     pub(crate) tab_index: Option<isize>,
     /// Astryx patch R20: this element and its subtree are inert.
     pub(crate) inert: bool,
+    /// Where this element's offscreen layer is kept for snapshots (Astryx patch R3).
+    pub(crate) retain_layer: Option<ElementId>,
     pub(crate) tab_group: bool,
     /// Astryx patch R12: a focus trap.
     pub(crate) tab_trap: bool,
@@ -2780,38 +2792,55 @@ impl Interactivity {
                     }
                 }
 
-                let transform = style.element_transform(bounds, window.rem_size());
-                window.with_element_transform(transform, |window| {
-                    window.with_text_style(style.text_style().cloned(), |window| {
-                        window.with_content_mask(
-                            style.overflow_mask(bounds, window.rem_size()),
-                            |window| {
-                                // Patch R20: nothing inert is a pointer target.
-                                let hitbox = if window.inert_depth == 0
-                                    && self.should_insert_hitbox(&style, window, cx)
-                                {
-                                    Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-                                } else {
-                                    None
-                                };
+                // Patch R3: an element that rotates composites its scale and
+                // translation with its layer.
+                let layer_effects =
+                    style.layer_effects(bounds, window.rem_size(), self.retain_layer.is_some());
+                let transform = if style.rotates() {
+                    None
+                } else {
+                    style.element_transform(bounds, window.rem_size())
+                };
+                let retain_layer = self.retain_layer.clone();
+                window.with_optional_offscreen_layer(
+                    retain_layer,
+                    bounds,
+                    layer_effects.as_ref(),
+                    |window| {
+                        window.with_element_transform(transform, |window| {
+                            window.with_text_style(style.text_style().cloned(), |window| {
+                                window.with_content_mask(
+                                    style.overflow_mask(bounds, window.rem_size()),
+                                    |window| {
+                                        // Patch R20: nothing inert is a pointer target.
+                                        let hitbox = if window.inert_depth == 0
+                                            && self.should_insert_hitbox(&style, window, cx)
+                                        {
+                                            Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                                        } else {
+                                            None
+                                        };
 
-                                let scroll_offset =
-                                    self.clamp_scroll_position(bounds, &style, window, cx);
-                                let result = window.with_element_opacity(style.opacity, |window| {
-                                    f(&style, scroll_offset, hitbox, window, cx)
-                                });
-                                self.insert_scrollbar_hitboxes(
-                                    bounds,
-                                    &style,
-                                    scroll_offset,
-                                    window,
-                                    cx,
-                                );
-                                (result, element_state)
-                            },
-                        )
-                    })
-                })
+                                        let scroll_offset =
+                                            self.clamp_scroll_position(bounds, &style, window, cx);
+                                        let result = window
+                                            .with_element_opacity(style.opacity, |window| {
+                                                f(&style, scroll_offset, hitbox, window, cx)
+                                            });
+                                        self.insert_scrollbar_hitboxes(
+                                            bounds,
+                                            &style,
+                                            scroll_offset,
+                                            window,
+                                            cx,
+                                        );
+                                        (result, element_state)
+                                    },
+                                )
+                            })
+                        })
+                    },
+                )
             },
         )
     }
@@ -2965,12 +2994,30 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
 
-                let transform = style.element_transform(bounds, window.rem_size());
-                window.with_element_transform(transform, |window| {
-                    window.with_element_opacity(style.opacity, |window| {
-                        style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
-                            window.with_text_style(style.text_style().cloned(), |window| {
-                                window.with_content_mask(
+                let layer_effects =
+                    style.layer_effects(bounds, window.rem_size(), self.retain_layer.is_some());
+                let transform = if style.rotates() {
+                    None
+                } else {
+                    style.element_transform(bounds, window.rem_size())
+                };
+                let retain_layer = self.retain_layer.clone();
+                window.with_optional_offscreen_layer(
+                    retain_layer,
+                    bounds,
+                    layer_effects.as_ref(),
+                    |window| {
+                        window.with_element_transform(transform, |window| {
+                            window.with_element_opacity(style.opacity, |window| {
+                                style.paint(
+                                    bounds,
+                                    window,
+                                    cx,
+                                    |window: &mut Window, cx: &mut App| {
+                                        window.with_text_style(
+                                            style.text_style().cloned(),
+                                            |window| {
+                                                window.with_content_mask(
                                     style.overflow_mask(bounds, window.rem_size()),
                                     |window| {
                                         window.with_tab_scope(tab_group, self.tab_trap, |window| {
@@ -3067,10 +3114,14 @@ impl Interactivity {
                                         })
                                     },
                                 );
+                                            },
+                                        );
+                                    },
+                                );
                             });
                         });
-                    });
-                });
+                    },
+                );
 
                 ((), element_state)
             },

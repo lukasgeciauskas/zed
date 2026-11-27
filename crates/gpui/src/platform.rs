@@ -1473,6 +1473,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
+    /// Whether the renderer draws offscreen layers (Astryx patch R3): a
+    /// scene's [`crate::Scene::offscreen_layers`], each drawn to a texture and
+    /// composited through [`crate::LayerComposite`]s. When it doesn't, the
+    /// window never puts layers in a scene and paints their subtrees
+    /// directly; see [`crate::Window::with_offscreen_layer`].
+    fn supports_offscreen_layers(&self) -> bool {
+        false
+    }
+
     // macOS specific methods
     fn get_title(&self) -> String {
         String::new()

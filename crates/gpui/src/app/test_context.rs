@@ -442,6 +442,13 @@ impl TestAppContext {
         self.test_platform.set_native_pickers_supported(supported);
     }
 
+    /// Whether this app's windows draw offscreen layers (Astryx patch R3).
+    /// On by default; off, they paint layers' subtrees directly, as a
+    /// renderer without layers (Metal) does.
+    pub fn set_offscreen_layers_supported(&self, supported: bool) {
+        self.test_platform.set_offscreen_layers_supported(supported);
+    }
+
     /// The native picker a window opened and nothing has answered yet.
     pub fn native_picker_request(&self) -> Option<crate::NativePickerRequest> {
         self.test_platform.native_picker_request()
